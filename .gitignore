@@ -1,0 +1,51 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# ---- 配置与密钥 ----
+*.bak
+*.old
+*.orig
+*.tmp
+.env
+.env.local
+.env.production
+.env.development
+!.env.example
+*.key
+*.pem
+
+# ---- 浏览器会话数据（包含 cf_clearance 等敏感 cookie，切勿提交）----
+browser_data/
+.*_profile/
+.*_profile*/
+.*profile/
+.*profile*/
+*.ck_profile*/
+*.fp_test*/
+*.dbg_profile*/
+
+# ---- 运行时数据 ----
+data/
+data/uploads/
+*.log
+
+# ---- 逆向研究材料（含上游前端代码与 cookie 转储，不公开）----
+research/
+
+# ---- 开发期测试与调试脚本（不随开源版分发）----
+tools/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

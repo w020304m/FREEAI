@@ -1,0 +1,4 @@
+# 批处理文件必须保持 CRLF（LF-only 会导致 cmd goto/label 解析异常）
+*.bat text eol=crlf
+# .env 保持原样（含中文注释）
+.env.example text eol=crlf

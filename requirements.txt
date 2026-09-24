@@ -1,0 +1,19 @@
+# ---- 核心 Web 框架 ----
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+
+# ---- HTTP 客户端 ----
+httpx>=0.27
+curl_cffi>=0.7          # TLS 指纹伪装（session.py 备选后端）
+
+# ---- CDP 桥（必需：与浏览器 DevTools 协议通信，缺失会导致网关完全不可用）----
+websocket-client>=1.7
+
+# ---- 配置 ----
+pydantic-settings>=2.2
+python-dotenv>=1.0
+
+# ---- 浏览器自动化（session.py 备选后端；CDP 桥模式下非必需）----
+playwright>=1.44
+playwright-stealth>=1.0.6
