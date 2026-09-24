@@ -23,6 +23,11 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional
 
+try:
+    from socket import timeout as SocketTimeout  # noqa: N812
+except ImportError:  # pragma: no cover
+    SocketTimeout = TimeoutError
+
 logger = logging.getLogger(__name__)
 
 
@@ -100,11 +105,19 @@ def _probe_status(probe: Any) -> int:
 class CdpBridge:
     """附加到运行中的 Edge CDP 端口，只读执行页面内 fetch。"""
 
-    def __init__(self, port: int = 9230, chat_page: str = "https://aifreeforever.com/chat/gpt-5-mini") -> None:
+    def __init__(
+        self,
+        port: int = 9230,
+        chat_page: str = "https://aifreeforever.com/chat/gpt-5-mini",
+        image_page: str = "https://aifreeforever.com/image-generators/gpt-image-2",
+    ) -> None:
         self.port = port
         self.chat_page = chat_page
+        self.image_page = image_page
         self._proc: Optional[subprocess.Popen] = None
         self._ready = False
+        self._last_launch = 0.0
+        self._last_verify_prompt = 0.0
         self._cookies: List[Dict[str, Any]] = []
         self._cookie_file = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "browser_data", "cdp_cookies.json"
@@ -134,10 +147,37 @@ class CdpBridge:
     # ---------- 生命周期 ----------
 
     def launch(self) -> None:
-        """若 CDP 端口无响应，则启动一个干净 Edge 窗口（零自动化注入）。"""
+        """若 CDP 端口确实不可用，则启动一个干净浏览器窗口（零自动化注入）。
+
+        安全约束（重要）：
+        - 端口被占用时**绝不**再拉起新进程（重复拉起会抢端口并弄死已有窗口，
+          表现为之后永久 WinError 10061、所有请求 503）。
+        - 拉起操作有冷却时间，避免探测抖动引发反复拉起。
+        - 只有在本进程自己拉起过窗口时才做最小化，不干扰用户已有窗口。
+        """
         if self.is_alive():
-            logger.info("检测到 CDP 端口 %d 有响应，附加到已有窗口（是否已过验证由 ensure_ready 判定）", self.port)
+            logger.info("检测到 CDP 端口 %d 有响应，附加到已有窗口", self.port)
             return
+
+        # 端口仍被占用但 CDP 不响应：说明已有浏览器实例正在启动/繁忙，
+        # 此时再拉起只会抢端口。等待其就绪即可。
+        if self._port_in_use():
+            logger.info("端口 %d 已被占用但 CDP 暂未响应，等待其就绪（不再拉起新进程）", self.port)
+            for _ in range(10):
+                time.sleep(1.0)
+                if self.is_alive():
+                    logger.info("CDP 端口 %d 已就绪", self.port)
+                    return
+            logger.warning("端口 %d 占用中但 CDP 持续无响应；如需重启请手动关闭该浏览器窗口", self.port)
+            return
+
+        # 冷却：避免瞬时故障导致反复拉起
+        now = time.time()
+        if now - self._last_launch < 20.0:
+            logger.info("距上次拉起仅 %.0fs，跳过本次（冷却中）", now - self._last_launch)
+            return
+        self._last_launch = now
+
         from . import config as _cfg
 
         profile = os.path.join(
@@ -160,24 +200,124 @@ class CdpBridge:
             "--no-first-run",
             "--no-default-browser-check",
         ]
+        # 注意：不要用 --start-minimized 或屏幕外坐标 —— 它们会把窗口放到
+        # (-32000,-32000) 屏幕外角落，用户点击任务栏恢复时"点不开"。
+        # 正确做法：正常启动，端口就绪后用 ShowWindow(SW_MINIMIZE) 最小化，
+        # 窗口保留在屏幕内，任务栏可点击恢复；需要人机验证时由
+        # request_human_verification() 呼出到前台。
         # 出口代理（会话绑代理出口 IP：住宅代理可显著延长 cf_clearance 有效期 + 每 IP 图像配额按出口计）
         proxy = getattr(_cfg.settings, "OUTBOUND_PROXY", "") or ""
         if proxy:
             args.append(f"--proxy-server={proxy}")
             logger.info("窗口挂载出口代理: %s", proxy)
         args.append(self.chat_page)
-        logger.info("启动干净 Edge 窗口（零自动化注入，端口 %d）...", self.port)
+        logger.info("启动浏览器窗口（零自动化注入，端口 %d）...", self.port)
         try:
             self._proc = subprocess.Popen(args)
         except FileNotFoundError:
-            logger.error("找不到 Edge: %s", EDGE)
+            logger.error("找不到浏览器: %s", browser)
+            return
+        # 等待端口就绪后最小化，降低视觉干扰
+        for _ in range(20):
+            time.sleep(1.0)
+            if self.is_alive():
+                n = self._minimize_windows()
+                if n:
+                    logger.info("已最小化 %d 个浏览器窗口（会话保持后台运行）", n)
+                return
 
     def is_alive(self) -> bool:
+        """CDP 端口是否可用。
+
+        注意：单次探测失败**不等于**窗口已死（浏览器忙、GC 停顿都可能瞬时失败），
+        因此重试数次后才判定为不可用，避免误触发 launch() 把健康窗口弄坏。
+        """
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
+                    if r.status == 200:
+                        return True
+            except Exception:  # noqa: BLE001
+                pass
+            if attempt < 2:
+                time.sleep(0.4)
+        return False
+
+    def _port_in_use(self) -> bool:
+        """端口是否被占用（即使 CDP 不响应）。用于避免重复拉起进程。"""
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            return s.connect_ex(("127.0.0.1", self.port)) == 0
+
+    def _window_cdp(self, action: str) -> int:
+        """通过 CDP Browser domain 操作站点窗口（minimize / restore）。
+
+        为什么不用 ctypes 按 PID：uvicorn 重启后本进程可能没有 launch 记录
+        （_proc 为 None），而窗口仍在。CDP Browser.getWindowForTarget 直接
+        以 target 定位窗口，与进程无关，最可靠。
+
+        - minimize：把窗口摆回工作区（修复 Edge 记忆屏幕外位置导致的"点不开"）
+          再用 minimized 状态最小化 —— 不抢焦点（用户当前窗口不受打扰）。
+        - restore：窗口恢复并聚焦（用户需要过人机验证时呼出）。
+        """
+        if os.name != "nt":
+            return 0
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=3) as r:
-                return r.status == 200
-        except Exception:  # noqa: BLE001
-            return False
+            import websocket
+
+            ver = json.loads(
+                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=5).read()
+            )
+            ws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=10)
+            try:
+                _id = [0]
+
+                def call(method, params=None):
+                    _id[0] += 1
+                    mid = _id[0]
+                    ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
+                    while True:
+                        msg = json.loads(ws.recv())
+                        if msg.get("id") == mid:
+                            return msg.get("result", {})
+
+                n = 0
+                for p in self._list_pages():
+                    if not self._is_site(p):
+                        continue
+                    res = call("Browser.getWindowForTarget", {"targetId": p.get("id")})
+                    wid = res.get("windowId")
+                    if wid is None:
+                        continue
+                    if action == "minimize":
+                        # 先恢复窗口为屏幕内位置（防"点不开"），再最小化不抢焦点
+                        call("Browser.setWindowBounds", {
+                            "windowId": wid,
+                            "bounds": {"windowState": "normal", "left": 120, "top": 60,
+                                       "width": 1180, "height": 780},
+                        })
+                        call("Browser.setWindowBounds", {
+                            "windowId": wid, "bounds": {"windowState": "minimized"},
+                        })
+                    else:  # restore
+                        call("Browser.setWindowBounds", {
+                            "windowId": wid,
+                            "bounds": {"windowState": "normal", "left": 120, "top": 60,
+                                       "width": 1180, "height": 780},
+                        })
+                    n += 1
+                return n
+            finally:
+                ws.close()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("CDP 窗口操作失败（忽略）: %s", e)
+            return 0
+
+    def _minimize_windows(self) -> int:
+        """把站点窗口移回屏幕内并以"不抢焦点"方式最小化（不依赖本进程记录）。"""
+        return self._window_cdp("minimize")
 
     def _pick_slot(self) -> None:
         """CDP 模式下无 Playwright 槽位（供 turnstile.py 兼容判断）。"""
@@ -192,17 +332,26 @@ class CdpBridge:
             logger.warning("CDP 列表获取失败: %s", e)
             return []
 
-    def _find_page(self) -> Optional[Dict[str, Any]]:
+    def _find_page(self, prefer: str = "") -> Optional[Dict[str, Any]]:
         """找站内页面（用于页面内 fetch）。
 
-        优先取普通标签页；若窗口当前停在别处（如本地面板），退而取任意标签页
-        —— 因为只要该标签页所在浏览器已通过站点验证，同源 fetch 依然可用；
-        真正的站点归属由 ensure_site_page() 兜底。
+        prefer:
+          - "image"：优先图像工作台页（Turnstile / 图生图必须在这里采 token）
+          - "chat"：优先聊天页
+          - 空：任意站内页
         """
         pages = self._list_pages()
-        site = next((t for t in pages if "aifreeforever.com" in t.get("url", "")), None)
+        site = [t for t in pages if "aifreeforever.com" in t.get("url", "")]
+        if prefer == "image":
+            hit = next((t for t in site if "/image-generators" in t.get("url", "")), None)
+            if hit:
+                return hit
+        if prefer == "chat":
+            hit = next((t for t in site if "/chat/" in t.get("url", "")), None)
+            if hit:
+                return hit
         if site:
-            return site
+            return site[0]
         return pages[0] if pages else None
 
     def _new_tab(self, url: str) -> Optional[Dict[str, Any]]:
@@ -218,26 +367,39 @@ class CdpBridge:
             logger.warning("CDP 新开标签页失败: %s", e)
             return None
 
-    def ensure_site_page(self, timeout: float = 45.0) -> bool:
-        """确保窗口内有可用的站内页面；若被导航走则自动补开一个标签页。
-
-        场景：用户（或工具）把窗口导航到了本地面板/其他站点，导致站内 fetch 失去
-        上下文。此方法优先看是否已有站点标签页，否则新开一个并等待加载完成。
-        """
-        if any("aifreeforever.com" in t.get("url", "") for t in self._list_pages()):
-            return True
-        logger.info("窗口内无站内页面，自动新开标签页：%s", self.chat_page)
-        tgt = self._new_tab(self.chat_page)
-        if not tgt:
-            return False
-        wid = tgt.get("id")
+    def _wait_tab(self, url_part: str, timeout: float) -> bool:
         deadline = time.time() + timeout
         while time.time() < deadline:
-            time.sleep(2)
-            for t in self._list_pages():
-                if t.get("id") == wid or "aifreeforever.com" in t.get("url", ""):
-                    return True
-        return any("aifreeforever.com" in t.get("url", "") for t in self._list_pages())
+            if any(url_part in t.get("url", "") for t in self._list_pages()):
+                return True
+            time.sleep(1.0)
+        return any(url_part in t.get("url", "") for t in self._list_pages())
+
+    def ensure_site_page(self, timeout: float = 45.0) -> bool:
+        """确保同时有聊天页 + 图像工作台页。
+
+        实测：同源 fetch 两边都能打 API；但 Turnstile 只在工作台页稳定签发。
+        双 tab 常驻，按请求类型选页，避免改图时跑到 chat 页采 token。
+        """
+        pages = self._list_pages()
+        has_chat = any("/chat/" in t.get("url", "") and "aifreeforever.com" in t.get("url", "") for t in pages)
+        has_img = any("/image-generators" in t.get("url", "") for t in pages)
+        if not has_chat and not any("aifreeforever.com" in t.get("url", "") for t in pages):
+            logger.info("窗口内无站内页面，新开聊天页：%s", self.chat_page)
+            if not self._new_tab(self.chat_page):
+                return False
+            if not self._wait_tab("aifreeforever.com", timeout):
+                return False
+            has_chat = True
+        elif not has_chat:
+            logger.info("补开聊天页：%s", self.chat_page)
+            self._new_tab(self.chat_page)
+            has_chat = self._wait_tab("/chat/", min(timeout, 20.0))
+        if not has_img:
+            logger.info("补开图像工作台页（改图/Turnstile）：%s", self.image_page)
+            self._new_tab(self.image_page)
+            has_img = self._wait_tab("/image-generators", min(timeout, 20.0))
+        return has_chat or has_img or any("aifreeforever.com" in t.get("url", "") for t in self._list_pages())
 
     @staticmethod
     def _is_site(page: Optional[Dict[str, Any]]) -> bool:
@@ -251,10 +413,10 @@ class CdpBridge:
         return None
 
     def _activate(self, page: Dict[str, Any]) -> None:
-        """把目标标签页提到前台。
+        """把目标标签页提到前台（仅在人机验证等确需用户操作时调用）。
 
-        必须：Chrome/Edge 会对**后台标签页**的 JS 执行与网络做节流，导致
-        Runtime.evaluate 长时间挂起（实测表现为 "CDP fetch 失败: Connection timed out"）。
+        注意：每请求调用会把最小化/后台的窗口弹到前台，干扰用户 ——
+        因此常规请求**不**激活；只有超时重试或需要人工验证时才激活。
         """
         tid = page.get("id")
         if not tid:
@@ -268,26 +430,30 @@ class CdpBridge:
         except Exception as e:  # noqa: BLE001
             logger.debug("激活标签页失败（忽略）: %s", e)
 
-    async def _eval(self, expr: str, timeout: float = 300.0, restore_focus: bool = True) -> Any:
+    def _restore_windows(self) -> int:
+        """把站点窗口恢复并聚焦到前台（用户需人机验证时调用）。"""
+        return self._window_cdp("restore")
+
+    def request_human_verification(self, reason: str = "") -> None:
+        """把浏览器窗口呼出到前台，提示用户完成一次人工验证。
+
+        在检测到上游确实需要人机验证（challenge 页 / Turnstile 403）时调用，
+        让"平时静默、必要时打扰"成为默认行为。
+        """
+        logger.info("需要人工验证%s——已将浏览器窗口呼出到前台，请在窗口内完成验证", f"（{reason}）" if reason else "")
+        page = self._find_page()
+        if page:
+            self._activate(page)
+        n = self._restore_windows()
+        if n:
+            logger.info("已恢复 %d 个浏览器窗口", n)
+
+    async def _eval_once(
+        self, page: Dict[str, Any], expr: str, timeout: float
+    ) -> Any:
+        """对指定页面执行一次 evaluate（不激活、不切换前台）。"""
         import websocket
 
-        page = self._find_page()
-        if page and "aifreeforever.com" not in page.get("url", "") and "aifreeforever" in expr:
-            # 当前标签页不在站点源上：页面内 fetch('/api/...') 会因跨源失败 →
-            # 先补开一个站内标签页再执行
-            logger.info("当前标签页非站内源（%s），自动补开站内标签页", page.get("url", "")[:60])
-            self.ensure_site_page()
-            page = self._find_page()
-        if not page:
-            raise RuntimeError("未找到可用的浏览器标签页（请确认 Edge 窗口已打开）")
-
-        # 后台标签页会被浏览器节流（JS/网络挂起 → Connection timed out）→ 执行前提到前台，
-        # 执行完把用户原本的前台标签还原，把视觉干扰降到最低。
-        prev = self._active_page() if restore_focus else None
-        switched = False
-        if self._is_site(page) and (prev is None or prev.get("id") != page.get("id")):
-            self._activate(page)
-            switched = True
         ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=timeout)
         try:
             ws.send(
@@ -305,8 +471,36 @@ class CdpBridge:
                     return msg.get("result", {}).get("result", {}).get("value")
         finally:
             ws.close()
-            if switched and prev is not None:
-                self._activate(prev)
+
+    async def _eval(self, expr: str, timeout: float = 300.0, prefer: str = "") -> Any:
+        page = self._find_page(prefer=prefer)
+        if page and "aifreeforever.com" not in page.get("url", "") and "aifreeforever" in expr:
+            # 当前标签页不在站点源上：页面内 fetch('/api/...') 会因跨源失败 →
+            # 先补开一个站内标签页再执行
+            logger.info("当前标签页非站内源（%s），自动补开站内标签页", page.get("url", "")[:60])
+            self.ensure_site_page()
+            page = self._find_page(prefer=prefer)
+        if not page:
+            raise RuntimeError("未找到可用的浏览器标签页（请确认浏览器窗口已打开）")
+
+        # 常规路径：不激活、不切换前台，避免窗口自动弹出打扰用户。
+        # 仅当后台标签执行超时（浏览器节流）时，才激活一次并重试（并在结束时还原前台标签）。
+        try:
+            return await self._eval_once(page, expr, timeout)
+        except Exception as e:  # noqa: BLE001
+            is_timeout = isinstance(e, (TimeoutError, SocketTimeout)) \
+                or (hasattr(e, "__class__") and "Timeout" in e.__class__.__name__) \
+                or "timed out" in str(e).lower()
+            if not is_timeout:
+                raise
+            logger.info("后台标签执行超时，激活站点标签页后重试一次（不改变窗口显示状态）")
+            prev = self._active_page()
+            self._activate(page)
+            try:
+                return await self._eval_once(page, expr, timeout)
+            finally:
+                if prev is not None:
+                    self._activate(prev)
 
     async def ensure_ready(self, timeout: float = 600.0) -> bool:
         """探测窗口会话是否可用。
@@ -315,7 +509,8 @@ class CdpBridge:
         （cookie 有效时直接可用），因此这里的判定完全是「用一次看看能不能通」：
 
         - 页面正常 + API 返回 200  → 就绪（无论是否弹过验证）
-        - 页面是 Cloudflare 挑战页 → 未就绪（此时才需要用户手动过一次）
+        - 页面是 Cloudflare 挑战页 → 未就绪（此时才需要用户手动过一次），
+          并**把浏览器窗口呼出到前台**（限频，避免反复打扰）让用户完成验证
         - 其他异常（超时/5xx/网络）→ 未就绪，但**不代表需要验证**
 
         窗口失联时自动重新拉起。
@@ -323,7 +518,7 @@ class CdpBridge:
         deadline = time.time() + timeout
         while time.time() < deadline:
             if not self.is_alive():
-                logger.warning("CDP 窗口失联，重新拉起 Edge...")
+                logger.warning("CDP 窗口失联，重新拉起浏览器...")
                 self.launch()
                 await asyncio.sleep(4)
             if not self.ensure_site_page(timeout=20.0):
@@ -352,7 +547,10 @@ class CdpBridge:
                         # 只有这种情况才可能真的需要人工过验证；也仍可能是 IP 限流
                         challenge = self._page_is_challenge()
                         if challenge:
-                            logger.info("需要人机验证：页面仍是 Cloudflare 挑战页，请在浏览器窗口内完成一次")
+                            now = time.time()
+                            if now - self._last_verify_prompt > 60:
+                                self._last_verify_prompt = now
+                                self.request_human_verification("检测到 Cloudflare 挑战页")
                         else:
                             logger.info("API 返回 %s，但页面未见验证挑战（可能是 IP 限流或上游异常）", status)
                     else:
@@ -428,7 +626,10 @@ class CdpBridge:
         body: Optional[Dict[str, Any]] = None,
         headers: Optional[Dict[str, str]] = None,
         timeout: float = 300.0,
+        prefer: str = "",
     ) -> Dict[str, Any]:
+        if not prefer and ("generate-image" in url or "upload-photo" in url or "moderate-image" in url):
+            prefer = "image"
         expr = f"""(async () => {{
             const r = await fetch('{url}', {{
                 method: '{method}',
@@ -439,7 +640,7 @@ class CdpBridge:
             return JSON.stringify({{status: r.status, text: t.slice(0, 200000)}});
         }})()"""
         try:
-            out = await self._eval(expr, timeout=timeout)
+            out = await self._eval(expr, timeout=timeout, prefer=prefer)
             parsed = json.loads(out or "{}")
             return {"ok": parsed.get("status") == 200, "status": parsed.get("status"), "text": parsed.get("text", "")}
         except Exception as e:  # noqa: BLE001
@@ -472,7 +673,7 @@ class CdpBridge:
             }}
         }})()"""
         try:
-            out = await self._eval(expr, timeout=timeout)
+            out = await self._eval(expr, timeout=timeout, prefer="image")
             parsed = json.loads(out or "{}")
             return {"ok": parsed.get("status") == 200, "status": parsed.get("status"), "text": parsed.get("text", "")}
         except Exception as e:  # noqa: BLE001
@@ -567,10 +768,12 @@ class CdpBridge:
         except Exception:  # noqa: BLE001
             pass
 
-        page = self._find_page()
+        self.ensure_site_page(timeout=25.0)
+        page = self._find_page(prefer="image")
         if not page:
             logger.warning("Turnstile 采集：未找到页面")
             return None
+        logger.info("Turnstile 采集页: %s", (page.get("url") or "")[:80])
 
         import websocket
 
@@ -604,6 +807,19 @@ class CdpBridge:
             return r.get("result", {}).get("value")
 
         try:
+            # 最小化 / 后台 tab 里 Turnstile 不签发（document.hidden=true）。
+            # 采集期间：恢复窗口 + 激活工作台 tab，等到可见再点。
+            try:
+                self._restore_windows()
+                self._activate(page)
+            except Exception:  # noqa: BLE001
+                pass
+            for _ in range(20):
+                vis = ev("document.visibilityState")
+                if vis == "visible":
+                    break
+                await asyncio.sleep(0.25)
+            logger.info("Turnstile 采集前 visibility=%s", ev("document.visibilityState"))
             # 1) 注入并渲染 managed 模式 widget（可见）
             out = ev(
                 f"""(async () => {{
@@ -717,6 +933,10 @@ class CdpBridge:
         finally:
             try:
                 ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._minimize_windows()
             except Exception:  # noqa: BLE001
                 pass
 

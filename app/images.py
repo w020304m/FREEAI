@@ -5,8 +5,14 @@
     body: {prompt, resolution, output_format, seed, model_type:"fast", source:"chatbot", interactionProof}
     → {success, images:[url], imageUrl, chatBypassRemaining}（无需 turnstile token，但每 IP 每日限额 → 429）
 - 图像工作台      POST /api/v2/generate-image
-    body: {modelId, prompt, aspect_ratio, turnstileToken, referenceImageUrl(s)?}
-    → {success, images:[url]}（严格需要 turnstile token；图生图走此路）
+    body: {modelId, prompt, aspect_ratio, turnstileToken,
+           referenceImageUrl, referenceImageUrls?}
+    → {success, images:[url]}（严格需要 turnstile token）
+    图生图官方流程（逆向自 ImageGeneratorWorkspaceApp）：
+      1. POST /api/moderate-image  multipart file
+      2. POST /api/upload-photo    multipart file → {url|imageUrl}
+      3. POST /api/v2/generate-image，referenceImageUrl(s) 必须是步骤 2 的 **http(s) URL**
+         （塞 data-URI / 裸 base64 会被上游拒绝）
 - 合规检查        POST /api/moderate-image（multipart file → {result: pass}）
 
 传输：一律在"已通过人机验证"的浏览器页面上下文内 fetch（可靠绕过 Cloudflare）。
@@ -19,7 +25,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from . import config, formats
+from . import config
 from .session import BrowserManager
 
 logger = logging.getLogger(__name__)
@@ -136,22 +142,31 @@ class ImageProvider:
             "turnstileToken": turnstile_token,
         }
         if reference_images:
-            refs = [formats.make_data_uri(im, "image/png") for im in reference_images[:3]]
-            if len(refs) == 1:
-                body["referenceImageUrl"] = refs[0]
-            else:
-                body["referenceImageUrls"] = refs
+            # 官方工作台：先 upload-photo 拿 http(s) URL，再作为 referenceImageUrl(s)。
+            # 直接塞 data-URI / 裸 base64 会被上游拒绝（403/500）。
+            uploaded: List[str] = []
+            for im in reference_images[:3]:
+                url = await self.upload_photo(im)
+                if url:
+                    uploaded.append(url)
+            if not uploaded:
+                return {"ok": False, "status": 502, "error": "参考图上传失败（/api/upload-photo 未返回 URL）"}
+            body["referenceImageUrl"] = uploaded[0]
+            if len(uploaded) > 1:
+                body["referenceImageUrls"] = uploaded
         headers = {"x-api-secret": ""}
-        # 优先复用缓存 token（TTL 内），避免"先发空 token 撞 403 再采集"的两段式浪费
+        # 工作台必须带 token。先读缓存，没有就采；不要先发空 token（会浪费一次，后面还容易 duplicate）。
         if not turnstile_token:
             try:
-                from .turnstile import get_cached_only
+                from .turnstile import get_cached_only, get_cached_or_harvest
 
                 turnstile_token = get_cached_only(self.session) or ""
+                if not turnstile_token:
+                    turnstile_token = await get_cached_or_harvest(self.session) or ""
                 if turnstile_token:
                     body["turnstileToken"] = turnstile_token
             except Exception as e:  # noqa: BLE001
-                logger.debug("读取缓存 token 失败: %s", e)
+                logger.debug("读取/采集 token 失败: %s", e)
         if turnstile_token:
             headers["x-captcha-verified-at"] = str(int(time.time() * 1000))
             headers["x-turnstile-token"] = turnstile_token
@@ -161,8 +176,20 @@ class ImageProvider:
             )
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "status": -1, "error": f"浏览器 fetch 失败: {e}"}
+        finally:
+            # token 发出即作废（即使这次 503/403，也不能再拿去换模型）
+            if turnstile_token or body.get("turnstileToken"):
+                try:
+                    from .turnstile import invalidate_cached
+
+                    invalidate_cached(self.session)
+                except Exception:  # noqa: BLE001
+                    pass
         # 403 且提示缺 token → 尝试自动采集 Turnstile token 后重试一次
-        if res.get("status") == 403 and "missing-input-response" in res.get("text", ""):
+        if res.get("status") == 403 and (
+            "missing-input-response" in res.get("text", "")
+            or "timeout-or-duplicate" in res.get("text", "")
+        ):
             logger.warning("v2 图像生成缺 Turnstile token，尝试自动采集并重试")
             try:
                 from .turnstile import get_cached_or_harvest
@@ -194,6 +221,48 @@ class ImageProvider:
                 wait = 60
             return {"ok": False, "status": 429, "error": f"每 IP 每日限额，约 {wait} 秒后重试"}
         if not res.get("ok"):
+            text = res.get("text", "") or ""
+            if reference_images and "at capacity" in text.lower():
+                alt = await self._fallback_edit_model(model)
+                if alt:
+                    logger.warning("模型 %s 容量满，按官方 silent-fallback 改试 %s", model, alt)
+                    body["modelId"] = alt
+                    try:
+                        from .turnstile import get_cached_or_harvest
+
+                        fresh = await get_cached_or_harvest(self.session)
+                        if fresh:
+                            body["turnstileToken"] = fresh
+                            headers = {
+                                "x-api-secret": "",
+                                "x-captcha-verified-at": str(int(time.time() * 1000)),
+                                "x-turnstile-token": fresh,
+                            }
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("换模型前重新采集 token 失败: %s", e)
+                    try:
+                        res = await self.session.fetch(
+                            config.settings.image_gen_v2_url,
+                            method="POST",
+                            body=body,
+                            headers=headers,
+                            timeout=240.0,
+                        )
+                    except Exception as e2:  # noqa: BLE001
+                        return {"ok": False, "status": -1, "error": f"换模型重试失败: {e2}"}
+                    if not res.get("ok"):
+                        return {"ok": False, "status": res.get("status"), "head": res.get("text", "")[:300]}
+                    try:
+                        data = json.loads(res.get("text", "{}"))
+                    except Exception:  # noqa: BLE001
+                        return {"ok": False, "status": res.get("status"), "head": res.get("text", "")[:300]}
+                    urls = data.get("images") or []
+                    return {
+                        "ok": bool(data.get("success")),
+                        "urls": urls,
+                        "used_model": alt,
+                        "head": res.get("text", "")[:400],
+                    }
             return {"ok": False, "status": res.get("status"), "head": res.get("text", "")[:300]}
         try:
             data = json.loads(res.get("text", "{}"))
@@ -201,6 +270,58 @@ class ImageProvider:
             return {"ok": False, "status": res.get("status"), "head": res.get("text", "")[:300]}
         urls = data.get("images") or []
         return {"ok": bool(data.get("success")), "urls": urls, "head": res.get("text", "")[:400]}
+
+    # 官方工作台 canRefImage/canEdit=true 的模型（逆向自 MODEL_REGISTRY）
+    EDIT_MODELS = (
+        "qwen-image",
+        "seedream-4",
+        "grok-imagine",
+        "gpt-image-2-5-flare",
+        "gpt-image-2-5-sunburst",
+        "gpt-image-2",
+    )
+
+    async def _fallback_edit_model(self, current: str) -> str:
+        """容量满时换一个仍支持参考图、且可用性更高的模型。"""
+        avail: Dict[str, float] = {}
+        try:
+            res = await self.session.fetch(config.settings.model_availability_url, timeout=20.0)
+            if res.get("ok"):
+                data = json.loads(res.get("text") or "{}")
+                for m in data.get("models") or []:
+                    mid = m.get("modelId") or m.get("id") or ""
+                    pct = m.get("availabilityPct")
+                    if mid and pct is not None:
+                        avail[mid] = float(pct)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("读 model-availability 失败: %s", e)
+        cands = [m for m in self.EDIT_MODELS if m != current]
+        cands.sort(key=lambda m: avail.get(m, 0.0), reverse=True)
+        for m in cands:
+            if avail.get(m, 0.0) >= 20:
+                return m
+        return cands[0] if cands else ""
+
+    # ---------- 参考图上传（图生图必须先拿到 http(s) URL）----------
+
+    async def upload_photo(self, image_bytes: bytes, filename: str = "ref.png") -> str:
+        """POST /api/upload-photo → 返回官方可引用的图片 URL。失败返回空串。"""
+        try:
+            b64 = base64.b64encode(image_bytes).decode()
+            res = await self.session.fetch_multipart(
+                config.settings.upload_photo_url, "file", filename, b64, "image/png"
+            )
+            if not res.get("ok"):
+                logger.warning("upload-photo 失败 HTTP %s: %s", res.get("status"), (res.get("text") or "")[:200])
+                return ""
+            data = json.loads(res.get("text", "{}") or "{}")
+            url = data.get("url") or data.get("imageUrl") or ""
+            if not url:
+                logger.warning("upload-photo 未返回 url: %s", (res.get("text") or "")[:200])
+            return url
+        except Exception as e:  # noqa: BLE001
+            logger.warning("upload-photo 异常: %s", e)
+            return ""
 
     # ---------- 合规检查 ----------
 

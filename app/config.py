@@ -28,8 +28,10 @@ class Settings(BaseSettings):
 
     # ---- 上游 ----
     MAIN_ORIGIN: str = "https://aifreeforever.com"
-    # 聊天页（用于获取 cf_clearance 会话）
+    # 聊天页（聊天接口 / 会话探测）
     CHAT_PAGE: str = "https://aifreeforever.com/chat/gpt-5-mini"
+    # 图像工作台（图生图 / Turnstile 采集必须在这个页，chat 页经常签不出 token）
+    IMAGE_PAGE: str = "https://aifreeforever.com/image-generators/gpt-image-2"
 
     # ---- 浏览器（会话获取 / 人机验证）----
     BROWSER_EXECUTABLE: str = ""
@@ -80,6 +82,15 @@ class Settings(BaseSettings):
     @property
     def moderate_image_url(self) -> str:
         return f"{self.MAIN_ORIGIN}/api/moderate-image"
+
+    @property
+    def model_availability_url(self) -> str:
+        return f"{self.MAIN_ORIGIN}/api/v2/model-availability"
+
+    @property
+    def upload_photo_url(self) -> str:
+        """图生图参考图上传。官方工作台：moderate → upload-photo → 把返回 URL 塞进 v2。"""
+        return f"{self.MAIN_ORIGIN}/api/upload-photo"
 
     # 站点 Turnstile sitekey（逆向自前端 __PUBLIC_ENV__）
     TURNSTILE_SITEKEY: str = "0x4AAAAAADGj2nznqyRfB0Lj"

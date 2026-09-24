@@ -55,6 +55,9 @@
   *,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}
 }
 *{box-sizing:border-box;margin:0;padding:0}
+/* hidden 属性必须优先于任何 display 声明（否则 .preview/.gallery 等带
+   display 的元素即使设置 hidden 也会被显示 —— 表现为"删除后仍然存在"） */
+[hidden]{display:none !important}
 html{-webkit-text-size-adjust:100%}
 body{
   background:var(--bg);color:var(--text);font-family:var(--font);
@@ -1087,11 +1090,22 @@ $('gPrompt').addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && 
    ============================================================ */
 let editFile = null;
 const drop = $('eDrop');
+function clearThumb() {
+  if ($('eThumb').src) { try { URL.revokeObjectURL($('eThumb').src); } catch (e) {} $('eThumb').removeAttribute('src'); }
+}
 function setEditFile(f) {
-  if (!f) { editFile = null; $('ePreview').hidden = true; $('eDropIdle').hidden = false; $('eName').textContent = ''; return; }
+  if (!f) {
+    editFile = null;
+    $('ePreview').hidden = true; $('eDropIdle').hidden = false;
+    $('eName').textContent = '';
+    clearThumb();
+    $('eFile').value = '';                 // 允许再次选择同一个文件
+    return;
+  }
   if (!/^image\/(png|jpeg|webp)$/.test(f.type)) { toast('仅支持 PNG / JPG / WebP', 'warn'); return; }
   if (f.size > 5 * 1024 * 1024) { toast('图片超过 5MB 限制', 'warn'); return; }
   editFile = f;
+  clearThumb();                            // 换图时先释放旧的预览 URL
   $('eThumb').src = URL.createObjectURL(f);
   $('ePreview').hidden = false; $('eDropIdle').hidden = true;
   $('eName').textContent = `${f.name} · ${(f.size/1024).toFixed(0)} KB`;

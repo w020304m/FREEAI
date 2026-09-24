@@ -1,4 +1,4 @@
 @echo off
-REM 鏈�灏忓寲 Edge 绐楀彛锛堜細璇濅繚鎸佸悗鍙帮紝涓嶈鍏抽棴绐楀彛锛侊級
-powershell -ExecutionPolicy Bypass -File "%~dp0tools\minimize_window.ps1"
+REM 最小化浏览器 CDP 窗口（会话保持后台运行，不要关闭窗口！）
+powershell -ExecutionPolicy Bypass -File "%~dp0minimize_window.ps1"
 pause

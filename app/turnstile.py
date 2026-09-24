@@ -34,6 +34,11 @@ def _cache_key(browser: Any) -> str:
     return id(slot) if slot else f"cdp:{getattr(browser, 'port', 'na')}"
 
 
+def invalidate_cached(browser: Any) -> None:
+    """token 一次性：发出去之后必须丢掉，否则换模型重试会 timeout-or-duplicate。"""
+    _TOKEN_CACHE.pop(_cache_key(browser), None)
+
+
 def get_cached_only(browser: Any) -> Optional[str]:
     """只读缓存（不触发采集）：TTL 内的 token 直接复用，用于请求前预填。"""
     key = _cache_key(browser)

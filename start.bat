@@ -75,9 +75,9 @@ echo  健康检查   :  http://127.0.0.1:%PORT%/health
 echo  模型列表   :  http://127.0.0.1:%PORT%/v1/models
 echo  交互文档   :  http://127.0.0.1:%PORT%/docs
 echo.
-echo  * 启动后会自动弹出浏览器窗口
+echo  * 浏览器窗口默认最小化到任务栏，不抢焦点
 echo  * 多数情况下无需任何操作，直接即可调用接口
-echo  * 仅当页面显示 Cloudflare 验证时才需手动完成一次
+echo  * 需要人机验证或采集 token 时窗口会自动呼出；也可点任务栏打开
 echo  * 用 /health 查看状态: session_ready=true 即已可用
 echo.
 echo  停止:  按 Ctrl+C

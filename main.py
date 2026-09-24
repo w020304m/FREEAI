@@ -58,6 +58,7 @@ async def lifespan(app: FastAPI):
         session_manager = CdpBridge(
             port=config.settings.CDP_PORT,
             chat_page=config.settings.CHAT_PAGE,
+            image_page=config.settings.IMAGE_PAGE,
         )
         session_manager.launch()
     else:
@@ -139,7 +140,8 @@ async def check_ready():
         if not session_manager.is_alive():
             raise HTTPException(
                 status_code=503,
-                detail="浏览器窗口已关闭。请重新运行 start.bat 启动服务。",
+                detail="无法连接浏览器调试端口（CDP）。请确认浏览器窗口未被关闭；"
+                       "若已关闭，重新运行 start.bat 即可。",
             )
         if not session_manager.is_ready:
             # 就绪标志过期时做一次真实探测（命中即刷新标志；失败由业务层自然报错）
