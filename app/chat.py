@@ -45,6 +45,10 @@ FORMAT_MAP = {
 class ChatProvider:
     def __init__(self, session: BrowserManager) -> None:
         self.session = session
+        # nonce 短缓存：省掉每次对话前的一次上游往返（见 config.NONCE_CACHE_TTL）
+        self._nonce: str = ""
+        self._nonce_ts: float = 0.0
+        self._nonce_lock = asyncio.Lock()
 
     # ---------- 入口 ----------
 
@@ -81,20 +85,31 @@ class ChatProvider:
     # ---------- 公共上游调用 ----------
 
     async def get_nonce(self) -> str:
-        """获取上游 nonce（CDP 通道偶发超时，重试 3 次）。"""
-        for attempt in range(3):
-            try:
-                res = await self.session.fetch(config.settings.nonce_api_url, method="GET", timeout=60.0)
-                if res.get("ok"):
-                    data = json.loads(res.get("text", "{}"))
-                    nonce = data.get("nonce", "")
-                    if nonce:
-                        return nonce
-            except Exception as e:  # noqa: BLE001
-                logger.warning("获取 nonce 失败（第 %d 次）: %s", attempt + 1, e)
-            await asyncio.sleep(2)
-        logger.error("获取 nonce 连续失败 3 次")
-        return ""
+        """获取上游 nonce（CDP 通道偶发超时，重试 3 次；TTL 内复用缓存）。"""
+        async with self._nonce_lock:
+            now = time.time()
+            if self._nonce and now - self._nonce_ts < config.settings.NONCE_CACHE_TTL:
+                return self._nonce
+            for attempt in range(3):
+                try:
+                    res = await self.session.fetch(config.settings.nonce_api_url, method="GET", timeout=60.0)
+                    if res.get("ok"):
+                        data = json.loads(res.get("text", "{}"))
+                        nonce = data.get("nonce", "")
+                        if nonce:
+                            self._nonce = nonce
+                            self._nonce_ts = time.time()
+                            return nonce
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("获取 nonce 失败（第 %d 次）: %s", attempt + 1, e)
+                await asyncio.sleep(2)
+            logger.error("获取 nonce 连续失败 3 次")
+            return ""
+
+    def invalidate_nonce(self) -> None:
+        """上游拒绝请求后作废缓存的 nonce（若是单次有效，下次自动取新的）。"""
+        self._nonce = ""
+        self._nonce_ts = 0.0
 
     def _endpoint_for(self, model: str) -> str:
         ep = config.settings.MODEL_ENDPOINTS.get(model)
@@ -176,7 +191,7 @@ class ChatProvider:
         logger.info("chat upstream: %s model=%s qlen=%d hist=%d", endpoint, model, len(question), len(messages))
 
         if stream:
-            # 流式：浏览器内 fetch + reader 逐行解析
+            # 流式：浏览器内 fetch + reader 逐块回调（真流式，见 cdp_bridge.stream_chat）
             queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
             async def on_data(chunk: str) -> None:
@@ -185,11 +200,21 @@ class ChatProvider:
             async def on_end() -> None:
                 await queue.put(None)
 
-            task = asyncio.create_task(
-                self.session.stream_chat(
-                    url, payload, on_data, on_end, timeout=config.settings.UPSTREAM_TIMEOUT
-                )
-            )
+            async def stream_task() -> None:
+                """浏览器侧流式任务：异常也要及时投递到队列，不能让消费端干等超时。"""
+                try:
+                    await self.session.stream_chat(
+                        url, payload, on_data, on_end, timeout=config.settings.UPSTREAM_TIMEOUT
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.error("上游流式失败: %s", e)
+                    self.invalidate_nonce()
+                    try:
+                        await queue.put({"type": "error", "message": f"上游流式失败: {e}"})
+                    finally:
+                        await queue.put(None)
+
+            task = asyncio.create_task(stream_task())
             try:
                 while True:
                     try:
@@ -201,6 +226,9 @@ class ChatProvider:
                         break
                     if item is None:
                         break
+                    if isinstance(item, dict):
+                        yield item
+                        continue
                     evt = _parse_event_line(item)
                     if evt is None:
                         # CDP 桥回调的是已剥壳的纯 JSON（如 {"token":"..."}），直接解析
@@ -227,10 +255,12 @@ class ChatProvider:
         try:
             res = await self.session.fetch(url, method="POST", body=payload, timeout=config.settings.UPSTREAM_TIMEOUT)
         except Exception as e:  # noqa: BLE001
+            self.invalidate_nonce()
             yield {"type": "error", "message": f"浏览器 fetch 失败: {e}"}
             yield {"__done__": True}
             return
         if not res.get("ok"):
+            self.invalidate_nonce()
             status = res.get("status")
             body_text = res.get("text", "")[:300]
             detail = ""
@@ -268,8 +298,7 @@ class ChatProvider:
     # ---------- OpenAI 流式 ----------
 
     async def _stream_openai(self, request_data: Dict[str, Any], model: str, request_id: str) -> AsyncGenerator[bytes, None]:
-        question = _extract_last_user_question(request_data)
-        history = _extract_history(request_data)
+        question, history = _prepare_turn(request_data)
         system = _extract_system(request_data)
         tone = self._tone_from(request_data)
         fmt = self._format_from(request_data)
@@ -298,7 +327,9 @@ class ChatProvider:
                     yield formats.sse(ch).encode()
                 yield formats.DONE.encode()
                 return
-            # 未命中工具协议：正常按 token 分块输出
+            # 未命中工具协议：正常按 token 分块输出（含未闭合协议行时先清理，避免把标记吐给客户端）
+            if formats.TOOL_MARKER in content:
+                content = formats.strip_tool_marker(content)
             yield formats.sse(formats.openai_chunk(request_id, model, "")).encode()
             if error:
                 yield formats.sse(formats.openai_chunk(request_id, model, f"\n[error] {error}", "stop")).encode()
@@ -335,8 +366,7 @@ class ChatProvider:
     # ---------- OpenAI 非流式 ----------
 
     async def _nonstream_openai(self, request_data: Dict[str, Any], model: str, request_id: str) -> AsyncGenerator[bytes, None]:
-        question = _extract_last_user_question(request_data)
-        history = _extract_history(request_data)
+        question, history = _prepare_turn(request_data)
         system = _extract_system(request_data)
         tone = self._tone_from(request_data)
         fmt = self._format_from(request_data)
@@ -355,8 +385,10 @@ class ChatProvider:
         except Exception as e:  # noqa: BLE001
             error = str(e)
         content = "".join(buffer)
-        # 原生 tools：模型输出命中协议 → 转成 OpenAI tool_calls
+        # 原生 tools：模型输出命中协议 → 转成 OpenAI tool_calls；未命中但有残留协议行 → 清理
         tc = formats.parse_tool_call(content) if request_data.get("tools") else None
+        if tc is None and formats.TOOL_MARKER in content:
+            content = formats.strip_tool_marker(content)
         if tc:
             yield json.dumps(formats.openai_full_tool(request_id, model, tc["name"], tc["arguments"]), ensure_ascii=False).encode()
             return
@@ -367,8 +399,7 @@ class ChatProvider:
     # ---------- Anthropic 流式 ----------
 
     async def _stream_anthropic(self, request_data: Dict[str, Any], model: str, request_id: str) -> AsyncGenerator[bytes, None]:
-        question = _extract_last_user_question(request_data)
-        history = _extract_history(request_data)
+        question, history = _prepare_turn(request_data)
         system = _extract_system(request_data)
         tone = self._tone_from(request_data)
         fmt = self._format_from(request_data)
@@ -394,7 +425,9 @@ class ChatProvider:
                 for evt in formats.anthropic_stream_tool_events(request_id, model, tc["name"], tc["arguments"]):
                     yield formats.sse(evt).encode()
                 return
-            # 未命中：正常文本流
+            # 未命中：正常文本流（含残留协议行时先清理）
+            if formats.TOOL_MARKER in content:
+                content = formats.strip_tool_marker(content)
             yield formats.anthropic_stream_start(request_id, model).encode()
             yield formats.anthropic_block_start().encode()
             yield formats.anthropic_delta(content + (f"\n[error] {error}" if error else "")).encode()
@@ -432,8 +465,7 @@ class ChatProvider:
     # ---------- Anthropic 非流式 ----------
 
     async def _nonstream_anthropic(self, request_data: Dict[str, Any], model: str, request_id: str) -> AsyncGenerator[bytes, None]:
-        question = _extract_last_user_question(request_data)
-        history = _extract_history(request_data)
+        question, history = _prepare_turn(request_data)
         system = _extract_system(request_data)
         tone = self._tone_from(request_data)
         fmt = self._format_from(request_data)
@@ -452,8 +484,10 @@ class ChatProvider:
         except Exception as e:  # noqa: BLE001
             error = str(e)
         content = "".join(buffer)
-        # 原生 tools：转成 Anthropic tool_use block
+        # 原生 tools：转成 Anthropic tool_use block；未命中但有残留协议行 → 清理
         tc = formats.parse_tool_call(content) if request_data.get("tools") else None
+        if tc is None and formats.TOOL_MARKER in content:
+            content = formats.strip_tool_marker(content)
         if tc:
             yield json.dumps(formats.anthropic_full_tool(model, request_id, tc["name"], tc["arguments"]), ensure_ascii=False).encode()
             return
@@ -512,49 +546,84 @@ def _content_to_text(content: Any) -> str:
     return str(content or "")
 
 
-def _extract_history(request_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    messages = request_data.get("messages", [])
-    # 去掉最后一条 user（它作为 question），其余作为历史
-    msgs = list(messages)
-    while msgs and msgs[-1].get("role") != "user":
-        msgs.pop()
-    if msgs:
-        msgs = msgs[:-1]
-    for m in msgs:
-        role = m.get("role", "user")
-        if role == "system":
-            continue  # system 已由 _extract_system 处理
-        text = _content_to_text(m.get("content"))
-        # OpenAI assistant 消息级 tool_calls（content 常为 null）→ 文本占位（Agent compact 场景）
-        if not text and m.get("tool_calls"):
-            calls = []
-            for tc in m.get("tool_calls") or []:
-                fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                calls.append(f"[tool_call {fn.get('name', '')}({fn.get('arguments', '')})]")
-            text = "\n".join(calls)
-        # tool 角色（工具返回）→ 上游只认 user/assistant，转 user 保留结果文本
-        if role == "tool":
-            role = "user"
-        if text:
-            out.append({"role": role, "content": text})
-    return out
+def _tool_call_lines(m: Dict[str, Any]) -> List[str]:
+    """把 assistant 消息级 tool_calls 序列化成模型可读的文本占位。"""
+    lines = []
+    for tc in m.get("tool_calls") or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
+        args = fn.get("arguments", "")
+        if not isinstance(args, str):
+            try:
+                args = json.dumps(args, ensure_ascii=False)
+            except Exception:  # noqa: BLE001
+                args = "{}"
+        lines.append(f"[tool_call {fn.get('name', '')}({args})]")
+    return lines
 
 
-def _extract_last_user_question(request_data: Dict[str, Any]) -> str:
-    messages = request_data.get("messages", [])
-    for m in reversed(messages):
-        if m.get("role") == "user":
-            text = _content_to_text(m.get("content"))
-            if not text and m.get("tool_calls"):
-                # tool 消息可能 content 为空但带 tool_calls（紧凑历史场景）
-                calls = []
-                for tc in m.get("tool_calls") or []:
-                    fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                    calls.append(f"[tool_call {fn.get('name', '')}({fn.get('arguments', '')})]")
-                text = "\n".join(calls)
-            return text
-    return ""
+def _hist_entry(m: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """把任意消息转成上游历史条目；无法转换返回 None。
+
+    - assistant.tool_calls → 文本占位（agent compact 后历史保真）
+    - role=tool（历史中段的工具结果）→ user 角色的 [tool_result] 文本
+    """
+    role = m.get("role", "user")
+    if role == "system":
+        return None
+    text = _content_to_text(m.get("content"))
+    if role == "assistant" and m.get("tool_calls"):
+        lines = _tool_call_lines(m)
+        text = "\n".join(([text] if text else []) + lines)
+    if role == "tool":
+        role = "user"
+        text = f"[tool_result] {text}" if text else ""
+    if not text:
+        return None
+    return {"role": role, "content": text}
+
+
+def _prepare_turn(request_data: Dict[str, Any]) -> "tuple[str, List[Dict[str, str]]]":
+    """切分本轮对话 → (question, history)。
+
+    关键修复（agent 工具循环卡死第一轮的根因）：OpenAI 协议下 agent 回传工具结果时，
+    消息末尾是连续的 role="tool" 消息 —— 它们就是本轮要上游处理的"提问"。
+    旧实现只认 role="user"，工具结果被整段丢弃，模型拿不到结果、重复发起同一个
+    工具调用，agent 框架因此停摆。这里把末尾 tool 结果（含并行调用多条）拼进
+    question，并带上对应的 [tool_call] 上下文，与 tools_prompt 的续跑协议呼应。
+    """
+    msgs = [m for m in request_data.get("messages", []) if isinstance(m, dict) and m.get("role") != "system"]
+    if not msgs:
+        return "", []
+
+    # 末尾连续的 tool 结果（并行工具调用会有多条）
+    end = len(msgs)
+    tool_results: List[Dict[str, Any]] = []
+    while end > 0 and msgs[end - 1].get("role") == "tool":
+        end -= 1
+        tool_results.insert(0, msgs[end])
+
+    if tool_results:
+        parts: List[str] = []
+        if end > 0 and msgs[end - 1].get("role") == "assistant":
+            # 带上对应的 tool_call 上下文，模型才知道结果对应哪次调用
+            parts.extend(_tool_call_lines(msgs[end - 1]))
+            end -= 1
+        for t in tool_results:
+            txt = _content_to_text(t.get("content"))
+            parts.append(f"[tool_result] {txt or '（工具返回空结果）'}")
+        question = "\n".join(p for p in parts if p)
+    else:
+        last = msgs[-1]
+        question = _content_to_text(last.get("content"))
+        if not question and last.get("tool_calls"):
+            # assistant 结尾且 content 为空（agent 中断场景）→ 保留调用占位
+            question = "\n".join(_tool_call_lines(last))
+        end = len(msgs) - 1  # 最后一条本身是 question，不计入历史
+
+    history = [h for h in (_hist_entry(m) for m in msgs[:end]) if h]
+    return question, history
 
 
 def _extract_last_image(request_data: Dict[str, Any]) -> Optional[Any]:

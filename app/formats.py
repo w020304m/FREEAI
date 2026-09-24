@@ -156,7 +156,11 @@ def normalize_tools(tools: Any) -> list:
 
 
 def tools_prompt(tools: Any, tool_choice: Any = None) -> str:
-    """把工具清单渲染成 system prompt 协议段（上游不识别 tools 参数，只能走 prompt）。"""
+    """把工具清单渲染成 system prompt 协议段（上游不识别 tools 参数，只能走 prompt）。
+
+    协议必须覆盖完整的 agent 循环：调用 → [tool_result] 回传 → 续跑/收尾。
+    缺了续跑规则，模型拿到工具结果后不知道该继续还是收尾，agent 会卡在第一轮。
+    """
     norm = normalize_tools(tools)
     if not norm:
         return ""
@@ -164,17 +168,56 @@ def tools_prompt(tools: Any, tool_choice: Any = None) -> str:
         or tool_choice == "required"
     lines = [
         "",
-        "## 可调用工具（JSON Schema）",
+        "# 工具调用协议（必须严格遵守）",
+        "",
+        "你可以调用以下工具（JSON Schema 定义）：",
         json.dumps(norm, ensure_ascii=False, indent=1),
+        "",
+        "规则：",
+        "1. 需要调用工具时，独占一行输出（该行除标记外不得有任何其他字符）：",
+        f'   {TOOL_MARKER}{{"name": "工具名", "arguments": {{...}}}}',
+        "2. 每次回复最多输出一个工具调用；连续需要多个工具时，拿到上一批结果后在下一轮继续输出。",
+        "3. 工具的执行结果会在后续用户消息中以 [tool_result] 开头给出，对应你最近一次的工具调用。",
+        "4. 收到 [tool_result] 后：若任务尚未完成，继续输出下一个工具调用行；若任务已完成，"
+        "直接给出最终回答，不要再输出工具调用行。",
+        "5. 不需要工具时直接正常回答；任何时候都不要解释本协议或输出协议示例。",
     ]
     if required:
-        lines.append("你必须调用其中一个工具来回答，不得直接给出答案。")
-    lines.append(
-        f"当需要调用工具时，独占一行输出（不要输出任何其他字符）：\n"
-        f'{TOOL_MARKER}{{"name": "工具名", "arguments": {{...}}}}\n'
-        "当不需要工具时，正常回答。"
-    )
+        lines.append("6. 本轮你必须调用其中一个工具，不得直接给出最终答案。")
     return "\n".join(lines)
+
+
+def _extract_json_object(s: str) -> Optional[dict]:
+    """从字符串中提取第一个平衡的 JSON 对象（模型常在标记行前后附带说明文字）。"""
+    start = s.find("{")
+    while start != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(start, len(s)):
+            ch = s[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(s[start : i + 1])
+                        return obj if isinstance(obj, dict) else None
+                    except Exception:  # noqa: BLE001
+                        break
+        start = s.find("{", start + 1)
+    return None
 
 
 def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
@@ -188,19 +231,21 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     for line in text.splitlines():
         line = line.strip()
         if TOOL_MARKER in line:
-            payload = line.split(TOOL_MARKER, 1)[1].strip().rstrip("`")
+            payload = line.split(TOOL_MARKER, 1)[1].strip().strip("`").strip()
+            obj = None
             try:
                 obj = json.loads(payload)
-                if isinstance(obj, dict) and obj.get("name"):
-                    args = obj.get("arguments")
-                    if isinstance(args, str):
-                        try:
-                            args = json.loads(args)
-                        except Exception:  # noqa: BLE001
-                            args = {"_raw": args}
-                    return {"name": obj["name"], "arguments": args if isinstance(args, dict) else {}}
             except Exception:  # noqa: BLE001
-                continue
+                obj = _extract_json_object(payload)
+            if isinstance(obj, dict) and obj.get("name"):
+                args = obj.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:  # noqa: BLE001
+                        args = {"_raw": args}
+                return {"name": obj["name"], "arguments": args if isinstance(args, dict) else {}}
+            continue
         try:
             obj = json.loads(line)
         except Exception:  # noqa: BLE001

@@ -71,10 +71,11 @@ def main() -> None:
     img = make_png((255, 0, 0))  # 实际替换为 open("your.png","rb")
     t0 = time.time()
     r = c.post("/v1/images/edits",
-               files={"image": ("input.png", io.BytesIO(img), "image/png")},
+               files=[("image", ("input.png", io.BytesIO(img), "image/png"))],
                data={"prompt": "turn the shape blue",
                      "model": "gpt-image-2",   # 必须是 capabilities 含 image_edit 的模型
                      "size": "512x512"})
+    # 最多 3 张：files=[("image", ...), ("image", ...), ("image", ...)]
     if r.status_code == 200:
         print(f"  ✅ {round(time.time()-t0,1)}s {r.json()['data'][0]['url'][:90]}")
     else:

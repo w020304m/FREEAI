@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 # 上游图像模型（逆向自 image-generators 页面链接 + Aggregate-to-2api）
 IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
     "gpt-image-2": {"display": "GPT Image 2", "cap": ["image", "image_edit"], "ratios": ["1:1", "3:2", "2:3", "16:9", "9:16"]},
-    "gpt-image-2-5-flare": {"display": "GPT Image 2.5 Flare", "cap": ["image"], "ratios": None},
-    "gpt-image-2-5-sunburst": {"display": "GPT Image 2.5 Sunburst", "cap": ["image"], "ratios": None},
+    "gpt-image-2-5-flare": {"display": "GPT Image 2.5 Flare", "cap": ["image", "image_edit"], "ratios": None},
+    "gpt-image-2-5-sunburst": {"display": "GPT Image 2.5 Sunburst", "cap": ["image", "image_edit"], "ratios": None},
     "gpt-image-1-5": {"display": "GPT Image 1.5", "cap": ["image"], "ratios": None},
     "flux-fast": {"display": "FLUX Fast", "cap": ["image"], "ratios": None},
     "flux-schnell": {"display": "FLUX Schnell", "cap": ["image"], "ratios": None},

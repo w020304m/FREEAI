@@ -22,7 +22,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, List, Optional
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -137,7 +137,7 @@ async def check_ready():
     # （实测：高频 API 探测本身会加速触发 Cloudflare 重新挑战；
     #   真实探测由后台 _background_ready 低频循环负责维护 _ready 标志）
     if config.settings.CDP_PORT > 0:
-        if not session_manager.is_alive():
+        if not await session_manager.is_alive_async():
             raise HTTPException(
                 status_code=503,
                 detail="无法连接浏览器调试端口（CDP）。请确认浏览器窗口未被关闭；"
@@ -213,7 +213,7 @@ async def health():
     挑战页时才需要手动过一次。详见 hint 字段。
     """
     ready = session_manager.is_ready
-    alive = session_manager.is_alive() if config.settings.CDP_PORT > 0 else True
+    alive = await session_manager.is_alive_async() if config.settings.CDP_PORT > 0 else True
     if ready:
         hint = "运行正常，可直接调用接口。"
     elif not alive:
@@ -339,13 +339,18 @@ async def image_generations(request: Request):
     size = data.get("size", "1024x1024")
     response_format = data.get("response_format", "url")
     ratio = _ratio_from_size(size)
+    refs = await _refs_from_generation_body(data)
+    use_v2 = bool(refs) or (
+        model_registry.is_image_model(model) and model != config.settings.DEFAULT_IMAGE_MODEL
+    )
 
     results = []
     for _ in range(min(n, 4)):
-        # 默认走"聊天内置文生图"通道（无需 turnstile token，但每 IP 每日限额）；
-        # 仅当调用方显式指定了具体图像工作台模型时走 v2（需 turnstile，尽力自动采集）。
-        if model_registry.is_image_model(model) and model != config.settings.DEFAULT_IMAGE_MODEL:
-            r = await image_provider.generate_v2(model, prompt, ratio)
+        # 带参考图、或指定了工作台模型 → v2；否则走聊天内置文生图（免 token、有每日限额）。
+        if use_v2:
+            r = await image_provider.generate_v2(
+                model, prompt, ratio, reference_images=refs or None
+            )
         else:
             r = await image_provider.generate_chatbot(prompt, ratio)
         results.append(r)
@@ -375,7 +380,7 @@ async def image_generations(request: Request):
 @app.post("/v1/images/edits")
 async def image_edits(
     request: Request,
-    image: UploadFile = File(...),
+    image: Optional[UploadFile] = File(None),
     prompt: str = Form(...),
     model: str = Form(config.settings.DEFAULT_IMAGE_MODEL),
     n: int = Form(1),
@@ -383,15 +388,19 @@ async def image_edits(
     response_format: str = Form("url"),
 ):
     await check_ready()
-    raw = await image.read()
+    form = await request.form()
+    refs = await _refs_from_edit_form(form, image)
+    if not refs:
+        raise HTTPException(status_code=400, detail="请至少上传 1 张参考图（image，最多 3 张）")
     ratio = _ratio_from_size(size)
     n = max(1, min(int(n or 1), 4))
 
-    ok = await image_provider.moderate(raw)
-    if not ok:
-        raise HTTPException(status_code=400, detail="图片未通过上游合规检查")
+    for raw in refs:
+        ok = await image_provider.moderate(raw)
+        if not ok:
+            raise HTTPException(status_code=400, detail="图片未通过上游合规检查")
 
-    r = await image_provider.generate_v2(model, prompt, ratio, reference_images=[raw])
+    r = await image_provider.generate_v2(model, prompt, ratio, reference_images=refs)
     if not r.get("ok"):
         status = r.get("status", 502)
         msg = r.get("head", "")[:300]
@@ -413,6 +422,88 @@ def _ratio_from_size(size: str) -> str:
     from app.formats import ratio_from_size
 
     return ratio_from_size(size, config.settings.DEFAULT_ASPECT_RATIO)
+
+
+def _looks_like_image(name: str, ctype: str) -> bool:
+    n = (name or "").lower()
+    c = (ctype or "").lower()
+    return c.startswith("image/") or n.endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+
+async def _refs_from_edit_form(form, primary: Optional[UploadFile]) -> List[bytes]:
+    """OpenAI 兼容：image 一张；同名字段重复或 image[] / image_1..3 最多 3 张。"""
+    blobs: List[bytes] = []
+    seen = set()
+
+    async def add(up: Optional[UploadFile]) -> None:
+        if up is None:
+            return
+        filename = getattr(up, "filename", None) or ""
+        if not filename and not getattr(up, "file", None):
+            return
+        raw = await up.read()
+        if not raw:
+            return
+        key = (filename, len(raw), raw[:32])
+        if key in seen:
+            return
+        seen.add(key)
+        blobs.append(raw)
+
+    if primary is not None:
+        await add(primary)
+    for key in form.keys():
+        kl = key.lower()
+        if kl not in ("image", "image[]", "images", "image_1", "image_2", "image_3"):
+            continue
+        val = form.getlist(key)
+        for item in val:
+            if hasattr(item, "read"):
+                await add(item)
+    return blobs[:3]
+
+
+async def _refs_from_generation_body(data: dict) -> List[bytes]:
+    """文生图 JSON：image / images 可为 data-URI、http(s) URL 或纯 base64，最多 3 张。"""
+    import base64
+    import re
+
+    import httpx
+
+    raw_items = []
+    if data.get("image"):
+        raw_items.append(data["image"])
+    imgs = data.get("images")
+    if isinstance(imgs, list):
+        raw_items.extend(imgs)
+    elif isinstance(imgs, str) and imgs:
+        raw_items.append(imgs)
+    blobs: List[bytes] = []
+    for item in raw_items[:3]:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        s = item.strip()
+        try:
+            blob = b""
+            if s.startswith("data:image"):
+                m = re.match(r"data:image/[^;]+;base64,(.+)", s, re.S)
+                if m:
+                    blob = base64.b64decode(m.group(1))
+            elif s.startswith("http://") or s.startswith("https://"):
+                async with httpx.AsyncClient(timeout=30.0, trust_env=False) as c:
+                    r = await c.get(s)
+                    r.raise_for_status()
+                    blob = r.content
+            else:
+                # 注意 b64decode 默认宽松（非法字符被丢弃），'####' 之类会解出空字节串
+                blob = base64.b64decode(s)
+            if blob:
+                blobs.append(blob)
+            else:
+                logger.warning("参考图解析为空字节串，已跳过: %.40s", s)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("解析参考图失败: %s", e)
+    return blobs[:3]
 
 
 # ================= 文件 =================

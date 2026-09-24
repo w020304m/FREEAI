@@ -319,15 +319,37 @@ select{cursor:pointer;appearance:none;
   position:absolute;top:-8px;right:-8px;width:26px;height:26px;border-radius:50%;
   background:var(--red);color:#fff;border:2px solid var(--surface-1);display:grid;place-items:center;
 }
+.ref-thumbs{display:flex;flex-wrap:wrap;gap:10px;width:100%;justify-content:center}
+.ref-thumbs .preview img{max-height:96px}
 
 /* ---- Chat ---- */
 .chatwrap{display:flex;flex-direction:column;height:calc(100dvh - 190px);min-height:440px}
 .chat-tools{display:flex;gap:var(--sp-2);align-items:center;flex-wrap:wrap;padding-bottom:var(--sp-3);border-bottom:1px solid var(--border);margin-bottom:var(--sp-3)}
-.msgs{flex:1;overflow-y:auto;padding:var(--sp-2) var(--sp-1);display:flex;flex-direction:column;gap:var(--sp-3);scroll-behavior:smooth}
-.msg{max-width:min(88%,760px);padding:11px 15px;border-radius:var(--r-lg);white-space:pre-wrap;word-break:break-word;font-size:13.5px;line-height:1.68;position:relative}
-.msg.u{align-self:flex-end;background:var(--primary);color:#08101f;border-bottom-right-radius:5px;font-weight:450}
+/* 流式输出时每帧都会 scrollTop=scrollHeight，smooth 会造成"追不上"的回弹感，
+   因此容器用 auto；仅"回到最新"按钮用 JS smooth 滚动 */
+.msgs{flex:1;overflow-y:auto;padding:var(--sp-2) var(--sp-1);display:flex;flex-direction:column;gap:var(--sp-3);scroll-behavior:auto}
+.msg{max-width:min(88%,760px);padding:11px 15px;border-radius:var(--r-lg);word-break:break-word;font-size:13.5px;line-height:1.68;position:relative}
+.msg.u{align-self:flex-end;background:var(--primary);color:#08101f;border-bottom-right-radius:5px;font-weight:450;white-space:pre-wrap}
 .msg.a{align-self:flex-start;background:var(--surface-2);border:1px solid var(--border);border-bottom-left-radius:5px}
-.msg.sys{align-self:center;background:none;border:1px dashed var(--border-strong);color:var(--text-3);font-size:12px;max-width:100%;text-align:center}
+.msg.sys{align-self:center;background:none;border:1px dashed var(--border-strong);color:var(--text-3);font-size:12px;max-width:100%;text-align:center;white-space:pre-wrap}
+/* ---- 助手消息 Markdown 展示 ---- */
+.msg .md>:first-child{margin-top:0}
+.msg .md>:last-child{margin-bottom:0}
+.msg .md p{margin:5px 0;white-space:pre-wrap}
+.msg .md h1,.msg .md h2,.msg .md h3,.msg .md h4{margin:11px 0 5px;line-height:1.35;font-weight:640}
+.msg .md h1{font-size:15.5px}.msg .md h2{font-size:14.5px}.msg .md h3{font-size:14px}.msg .md h4{font-size:13.5px}
+.msg .md ul,.msg .md ol{padding-left:20px;margin:5px 0}
+.msg .md li{margin:2px 0}
+.msg .md li>p{margin:1px 0}
+.msg .md pre{background:#0a0e15;border:1px solid var(--border);border-radius:8px;padding:10px 12px;overflow-x:auto;margin:7px 0}
+.msg .md code{font-family:var(--mono);font-size:12px;background:var(--surface-3);border-radius:4px;padding:1px 5px}
+.msg .md pre code{background:none;padding:0;font-size:12px;line-height:1.55}
+.msg .md a{color:var(--primary-h)}
+.msg .md blockquote{border-left:3px solid var(--border-strong);padding-left:10px;color:var(--text-2);margin:6px 0}
+.msg .md hr{border:none;border-top:1px solid var(--border);margin:10px 0}
+.msg .md table{border-collapse:collapse;margin:7px 0;font-size:12.5px;display:block;overflow-x:auto;max-width:100%}
+.msg .md th,.msg .md td{border:1px solid var(--border-strong);padding:4px 9px;text-align:left}
+.msg .md th{background:var(--surface-3);font-weight:600}
 .msg .cursor{display:inline-block;width:7px;height:14px;background:var(--primary);vertical-align:text-bottom;animation:blink .85s steps(2,start) infinite;margin-left:2px}
 @keyframes blink{50%{opacity:0}}
 .msg-tools{display:flex;gap:6px;margin-top:7px;opacity:0;transition:opacity var(--dur) var(--ease)}
@@ -562,6 +584,19 @@ select{cursor:pointer;appearance:none;
                 <option value="b64_json">b64_json · Base64</option>
               </select>
             </div>
+            <div class="field" style="grid-column:1/-1">
+              <label>参考图 <span class="opt">可选 · 最多 3 张 · 走工作台 v2</span></label>
+              <div class="drop" id="gDrop" tabindex="0" role="button" aria-label="上传参考图：点击、拖放或粘贴，最多 3 张">
+                <div id="gDropIdle">
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
+                  <div class="big">可选参考图 · 最多 3 张</div>
+                  <div class="sml">PNG / JPG / WebP，单张 ≤5MB · 有参考图时走工作台通道</div>
+                </div>
+                <div class="ref-thumbs" id="gThumbs" hidden></div>
+                <div class="sml" id="gName"></div>
+              </div>
+              <input type="file" id="gFile" accept="image/png,image/jpeg,image/webp" multiple>
+            </div>
           </div>
 
           <div class="note warn" style="margin-top:var(--sp-4)">
@@ -602,22 +637,17 @@ select{cursor:pointer;appearance:none;
 
           <div class="grid-2">
             <div class="field">
-              <label>原图 <span class="opt">multipart · png/jpg/webp · ≤5MB</span></label>
-              <div class="drop" id="eDrop" tabindex="0" role="button" aria-label="上传图片：点击选择、拖放或粘贴">
+              <label>参考图 <span class="opt">最多 3 张 · png/jpg/webp · ≤5MB</span></label>
+              <div class="drop" id="eDrop" tabindex="0" role="button" aria-label="上传参考图：点击、拖放或粘贴，最多 3 张">
                 <div id="eDropIdle">
                   <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" style="margin-bottom:6px"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><path d="M17 8l-5-5-5 5"/><path d="M12 3v12"/></svg>
-                  <div class="big">点击选择 · 拖放到此处 · 或 Ctrl+V 粘贴</div>
-                  <div class="sml">PNG / JPG / WebP，最大 5MB</div>
+                  <div class="big">点击选择 · 拖放 · 或 Ctrl+V · 最多 3 张</div>
+                  <div class="sml">PNG / JPG / WebP，单张最大 5MB</div>
                 </div>
-                <div class="preview" id="ePreview" hidden>
-                  <img id="eThumb" alt="待修改图片预览">
-                  <button class="rm" id="eRm" type="button" aria-label="移除图片">
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
-                  </button>
-                </div>
+                <div class="ref-thumbs" id="eThumbs" hidden></div>
                 <div class="sml" id="eName"></div>
               </div>
-              <input type="file" id="eFile" accept="image/png,image/jpeg,image/webp">
+              <input type="file" id="eFile" accept="image/png,image/jpeg,image/webp" multiple>
             </div>
 
             <div>
@@ -628,7 +658,7 @@ select{cursor:pointer;appearance:none;
               <div class="field" style="margin-top:var(--sp-3)">
                 <label for="eModel">模型 <span class="opt">image_edit 能力</span></label>
                 <select id="eModel"></select>
-                <div class="help">支持改图的模型：gpt-image-2 · seedream-4 · qwen-image · grok-imagine</div>
+                <div class="help">可改图：gpt-image-2 / 2.5-flare / 2.5-sunburst · seedream-4 · qwen-image · grok-imagine</div>
               </div>
               <div class="grid-3" style="margin-top:var(--sp-3)">
                 <div class="field">
@@ -690,6 +720,7 @@ select{cursor:pointer;appearance:none;
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a1 1 0 011-1h6a1 1 0 011 1v2m3 0v14a1 1 0 01-1 1H6a1 1 0 01-1-1V6"/></svg>
             </button>
             <span class="help" id="cSessInfo"></span>
+            <span class="help" id="cGen" hidden style="color:var(--accent)"></span>
             <div class="grow"></div>
             <select id="cModel" style="max-width:200px" aria-label="选择模型"></select>
             <select id="cTone" style="max-width:120px" aria-label="语气">
@@ -784,8 +815,8 @@ print(r.content[0].text)</textarea>
             <label>图像编辑（curl · multipart）</label>
             <textarea class="mono" readonly style="min-height:96px">curl -X POST http://127.0.0.1:8110/v1/images/edits \
   -H "Authorization: Bearer <API_MASTER_KEY>" \
-  -F image=@input.png -F model=gpt-image-2 \
-  -F prompt="change the red square to blue"</textarea>
+  -F image=@input.png -F image=@ref2.png -F image=@ref3.png \
+  -F model=gpt-image-2 -F prompt="change the red square to blue"</textarea>
           </div>
         </div>
       </section>
@@ -1004,7 +1035,22 @@ function fillSelects() {
   $('gModel').innerHTML = opts(img, '— 无生图模型 —');
   $('eModel').innerHTML = opts(edit, '— 无可改图模型 —');
   $('cModel').innerHTML = opts(chat, '— 无可用聊天模型 —');
+  ['cModel', 'gModel', 'eModel'].forEach(restoreSelect);
 }
+
+/* 选择持久化：模型 / 语气 / 尺寸等刷新后保持上次的选择 */
+function restoreSelect(id) {
+  const s = $(id); if (!s) return;
+  try {
+    const saved = localStorage.getItem('gw_sel_' + id);
+    if (saved && [...s.options].some(o => o.value === saved)) s.value = saved;
+  } catch (e) {}
+}
+['cModel', 'gModel', 'eModel', 'cTone', 'cFormat', 'gSize', 'gN', 'gFmt', 'eSize', 'eN', 'eFmt'].forEach(id => {
+  const s = $(id); if (!s) return;
+  restoreSelect(id);
+  s.addEventListener('change', () => { try { localStorage.setItem('gw_sel_' + id, s.value); } catch (e) {} });
+});
 
 /* ============================================================
    图片结果卡片
@@ -1052,6 +1098,67 @@ async function toDataUrl(url) {
 /* ============================================================
    文生图
    ============================================================ */
+function bindRefPicker(prefix, {required, viewId}) {
+  const files = [];
+  const drop = $(prefix + 'Drop');
+  const idle = $(prefix + 'DropIdle');
+  const thumbs = $(prefix + 'Thumbs');
+  const nameEl = $(prefix + 'Name');
+  const input = $(prefix + 'File');
+  function render() {
+    thumbs.innerHTML = '';
+    files.forEach((f, i) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'preview';
+      const img = document.createElement('img');
+      img.alt = f.name; img.src = URL.createObjectURL(f);
+      const rm = document.createElement('button');
+      rm.className = 'rm'; rm.type = 'button'; rm.setAttribute('aria-label', '移除图片');
+      rm.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+      rm.onclick = ev => { ev.stopPropagation(); files.splice(i, 1); render(); };
+      wrap.append(img, rm);
+      thumbs.append(wrap);
+    });
+    idle.hidden = files.length > 0;
+    thumbs.hidden = files.length === 0;
+    nameEl.textContent = files.length ? `${files.length} / 3 张` : '';
+  }
+  function addList(list) {
+    for (const f of list) {
+      if (files.length >= 3) { toast('最多 3 张参考图', 'warn'); break; }
+      if (!/^image\/(png|jpeg|webp)$/.test(f.type)) { toast('仅支持 PNG / JPG / WebP', 'warn'); continue; }
+      if (f.size > 5 * 1024 * 1024) { toast('单张不能超过 5MB', 'warn'); continue; }
+      files.push(f);
+    }
+    render();
+  }
+  drop.onclick = e => { if (!e.target.closest('.rm')) input.click(); };
+  drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); } };
+  input.onchange = e => { addList([...e.target.files]); input.value = ''; };
+  ['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+  drop.addEventListener('drop', e => addList([...e.dataTransfer.files]));
+  window.addEventListener('paste', e => {
+    if (!$(viewId).classList.contains('on')) return;
+    const got = [...(e.clipboardData?.items || [])].filter(i => i.type.startsWith('image/')).map(i => i.getAsFile()).filter(Boolean);
+    if (got.length) { addList(got); toast('已从剪贴板粘贴图片'); }
+  });
+  return { files, required };
+}
+
+function fileToDataUrl(f) {
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = rej;
+    fr.readAsDataURL(f);
+  });
+}
+
+/* ============================================================
+   文生图
+   ============================================================ */
+const gRefs = bindRefPicker('g', {required:false, viewId:'view-txt2img'});
 $('gPrompt').oninput = () => { $('gCount').textContent = $('gPrompt').value.length; };
 $('gGo').onclick = async () => {
   const p = $('gPrompt').value.trim();
@@ -1059,12 +1166,14 @@ $('gGo').onclick = async () => {
   if (!$('gModel').value) { toast('没有可用的生图模型', 'warn'); return; }
   const btn = $('gGo'); const t0 = Date.now();
   btn.disabled = true;
-  $('gStat').innerHTML = `<span class="spin"></span> 上游生成中，约 10–15 秒…`;
+  $('gStat').innerHTML = `<span class="spin"></span> ${gRefs.files.length ? '上传参考图 → 验证 token → ' : ''}上游生成中…`;
   try {
+    const payload = { model: $('gModel').value, prompt: p, n: +$('gN').value,
+                      size: $('gSize').value, response_format: $('gFmt').value };
+    if (gRefs.files.length) payload.images = await Promise.all(gRefs.files.map(fileToDataUrl));
     const r = await api('/v1/images/generations', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ model: $('gModel').value, prompt: p, n: +$('gN').value,
-                             size: $('gSize').value, response_format: $('gFmt').value })
+      body: JSON.stringify(payload)
     });
     const d = await r.json();
     const items = d.data || [];
@@ -1086,45 +1195,12 @@ $('gGo').onclick = async () => {
 $('gPrompt').addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') $('gGo').click(); });
 
 /* ============================================================
-   图生图（拖放 / 粘贴 / 预览）
+   图生图（最多 3 张参考图）
    ============================================================ */
-let editFile = null;
-const drop = $('eDrop');
-function clearThumb() {
-  if ($('eThumb').src) { try { URL.revokeObjectURL($('eThumb').src); } catch (e) {} $('eThumb').removeAttribute('src'); }
-}
-function setEditFile(f) {
-  if (!f) {
-    editFile = null;
-    $('ePreview').hidden = true; $('eDropIdle').hidden = false;
-    $('eName').textContent = '';
-    clearThumb();
-    $('eFile').value = '';                 // 允许再次选择同一个文件
-    return;
-  }
-  if (!/^image\/(png|jpeg|webp)$/.test(f.type)) { toast('仅支持 PNG / JPG / WebP', 'warn'); return; }
-  if (f.size > 5 * 1024 * 1024) { toast('图片超过 5MB 限制', 'warn'); return; }
-  editFile = f;
-  clearThumb();                            // 换图时先释放旧的预览 URL
-  $('eThumb').src = URL.createObjectURL(f);
-  $('ePreview').hidden = false; $('eDropIdle').hidden = true;
-  $('eName').textContent = `${f.name} · ${(f.size/1024).toFixed(0)} KB`;
-}
-drop.onclick = e => { if (e.target.id !== 'eRm') $('eFile').click(); };
-drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('eFile').click(); } };
-$('eFile').onchange = e => setEditFile(e.target.files[0]);
-$('eRm').onclick = e => { e.stopPropagation(); setEditFile(null); };
-['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
-['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
-drop.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) setEditFile(f); });
-window.addEventListener('paste', e => {
-  if (!$('view-img2img').classList.contains('on')) return;
-  const it = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith('image/'));
-  if (it) { setEditFile(it.getAsFile()); toast('已从剪贴板粘贴图片'); }
-});
+const eRefs = bindRefPicker('e', {required:true, viewId:'view-img2img'});
 
 $('eGo').onclick = async () => {
-  if (!editFile) { toast('请先上传原图', 'warn'); drop.focus(); return; }
+  if (!eRefs.files.length) { toast('请至少上传 1 张参考图', 'warn'); $('eDrop').focus(); return; }
   const p = $('ePrompt').value.trim();
   if (!p) { toast('请填写修改指令', 'warn'); $('ePrompt').focus(); return; }
   const btn = $('eGo'); const t0 = Date.now();
@@ -1132,7 +1208,7 @@ $('eGo').onclick = async () => {
   $('eStat').innerHTML = `<span class="spin"></span> 合规检查 → 验证 token → 生成中（首次约 20–40 秒）…`;
   try {
     const fd = new FormData();
-    fd.append('image', editFile, editFile.name);
+    eRefs.files.forEach(f => fd.append('image', f, f.name));
     fd.append('prompt', p);
     fd.append('model', $('eModel').value);
     fd.append('n', $('eN').value);
@@ -1193,16 +1269,76 @@ function renderSession() {
     scrollMsgs(true);
   }
 }
+/* ---- 迷你 Markdown 渲染（先整体转义再解析，天然防注入；链接仅允许 http/https） ---- */
+function mdRender(src) {
+  const slots = [];
+  const keep = html => { slots.push(html); return '\u0000' + (slots.length - 1) + '\u0000'; };
+  const restore = s => s.replace(/\u0000(\d+)\u0000/g, (m, i) => slots[+i]);
+  const inline = s => restore(s
+    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, '$1<em>$2</em>'));
+
+  const text = esc(src).replace(/`([^`\n]+)`/g, (m, c) => keep(`<code>${c}</code>`));
+  const lines = text.split('\n');
+  let out = '', list = null, para = [], fence = null, fenceBuf = [];
+  const closeList = () => { if (list) { out += `</${list}>`; list = null; } };
+  const flushPara = () => { if (para.length) { out += `<p>${inline(para.join('\n'))}</p>`; para = []; } };
+  const flushFence = () => {
+    if (fence === null) return;
+    const pre = `<pre><code${fence ? ` data-lang="${fence}"` : ''}>${fenceBuf.join('\n')}</code></pre>`;
+    // 代码块跟在列表项后 → 归入当前 <li>（"- 标题 + 代码"这种常见形态）
+    if (list && out.endsWith('</li>')) out = out.slice(0, -5) + pre + '</li>';
+    else { flushPara(); closeList(); out += pre; }
+    fence = null; fenceBuf = [];
+  };
+  for (const ln of lines) {
+    if (fence !== null) {
+      if (/^\s*```\s*$/.test(ln)) flushFence();
+      else fenceBuf.push(ln);
+      continue;
+    }
+    const fm = ln.match(/^\s*```(\w*)\s*$/);
+    if (fm) { flushPara(); fence = fm[1]; fenceBuf = []; continue; }
+    let m;
+    if (/^\s*$/.test(ln)) { flushPara(); closeList(); continue; }
+    if ((m = ln.match(/^(#{1,4})\s+(.*)$/))) { flushPara(); closeList(); out += `<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`; continue; }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(ln)) { flushPara(); closeList(); out += '<hr>'; continue; }
+    if ((m = ln.match(/^\s*[-*+]\s+(.*)$/))) {
+      flushPara();
+      if (list !== 'ul') { closeList(); out += '<ul>'; list = 'ul'; }
+      out += `<li>${inline(m[1])}</li>`; continue;
+    }
+    if ((m = ln.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      flushPara();
+      if (list !== 'ol') { closeList(); out += '<ol>'; list = 'ol'; }
+      out += `<li>${inline(m[1])}</li>`; continue;
+    }
+    if ((m = ln.match(/^&gt;\s?(.*)$/))) { flushPara(); closeList(); out += `<blockquote>${inline(m[1])}</blockquote>`; continue; }
+    para.push(ln);
+  }
+  flushFence(); flushPara(); closeList();
+  return restore(out);
+}
+
+function toolsRow(getText) {
+  const tools = el('div', 'msg-tools');
+  const cp = el('button', '', '复制');
+  cp.onclick = async () => {
+    try { await navigator.clipboard.writeText(typeof getText === 'function' ? getText() : (getText || '')); toast('已复制'); }
+    catch (e) { toast('复制失败', 'err'); }
+  };
+  tools.appendChild(cp);
+  return tools;
+}
 function msgNode(role, text) {
   const n = el('div', 'msg ' + (role === 'user' ? 'u' : 'a'));
-  n.textContent = text || '';
-  if (role !== 'user') {
-    const tools = el('div', 'msg-tools');
-    const cp = el('button', '', '复制');
-    cp.onclick = async () => { try { await navigator.clipboard.writeText(n.textContent); toast('已复制'); } catch (e) { toast('复制失败', 'err'); } };
-    tools.appendChild(cp);
-    n.appendChild(tools);
-  }
+  const body = el('div', 'msg-text' + (role === 'user' ? '' : ' md'));
+  n.appendChild(body);
+  n._raw = text || '';
+  if (role === 'user') body.textContent = n._raw;
+  else body.innerHTML = mdRender(n._raw);
+  if (role !== 'user') n.appendChild(toolsRow(() => n._raw));
   return n;
 }
 function addMsg(role, text) { const n = msgNode(role, text); $('cMsgs').appendChild(n); scrollMsgs(); return n; }
@@ -1216,7 +1352,7 @@ $('cMsgs').addEventListener('scroll', () => {
   const box = $('cMsgs');
   $('cScroll').classList.toggle('on', box.scrollHeight - box.scrollTop - box.clientHeight >= 120);
 });
-$('cScroll').onclick = () => scrollMsgs(true);
+$('cScroll').onclick = () => { const b = $('cMsgs'); b.scrollTo({ top: b.scrollHeight, behavior: 'smooth' }); $('cScroll').classList.remove('on'); };
 
 /* 命名函数（便于测试与外部调用） */
 function newSession() {
@@ -1257,25 +1393,46 @@ $('cSess').onchange = e => switchSession(e.target.value);
 
 $('cSend').onclick = sendChat;
 $('cInput').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendChat(); }
+  // Enter 直接发送；Shift+Enter 换行；Ctrl/Cmd+Enter 也可发送；输入法组词中不触发
+  if (e.key === 'Enter' && !e.isComposing && (e.ctrlKey || e.metaKey || !e.shiftKey)) { e.preventDefault(); sendChat(); }
 });
 $('cStop').onclick = () => { if (abortChat) abortChat.abort(); };
+
+/* 流式期间的滚动合并到每帧一次，避免每个 token 都触发布局 */
+let scrollQueued = false;
+function scheduleScroll() {
+  if (scrollQueued) return;
+  scrollQueued = true;
+  requestAnimationFrame(() => { scrollQueued = false; scrollMsgs(); });
+}
 
 async function sendChat() {
   const input = $('cInput');
   const text = input.value.trim();
   if (!text) return;
   if (!$('cModel').value) { toast('没有可用的聊天模型', 'warn'); return; }
+  if (abortChat) return;
   const t0 = Date.now();
   addMsg('user', text);
   CHAT_HIST.push({ role:'user', content:text });
   input.value = '';
   input.style.height = 'auto';
 
-  const sendBtn = $('cSend'), stopBtn = $('cStop');
+  const sendBtn = $('cSend'), stopBtn = $('cStop'), genStat = $('cGen');
   sendBtn.hidden = true; stopBtn.hidden = false;
-  const node = addMsg('assistant', '');
-  const cursor = el('span', 'cursor'); node.appendChild(cursor);
+  genStat.hidden = false;
+  const genTimer = setInterval(() => { genStat.textContent = `生成中 · ${((Date.now() - t0) / 1000).toFixed(1)}s`; }, 100);
+  genStat.textContent = '生成中 · 0.0s';
+
+  /* 流式消息：正文放在独立文本节点里增量追加（O(新 chunk)），结束后再整体渲染 Markdown */
+  const node = el('div', 'msg a');
+  const body = el('div', 'msg-text md');
+  const tnode = document.createTextNode('');
+  const cursor = el('span', 'cursor');
+  body.append(tnode, cursor);
+  node.appendChild(body);
+  $('cMsgs').appendChild(node);
+  scheduleScroll();
 
   abortChat = new AbortController();
   let full = '';
@@ -1306,16 +1463,12 @@ async function sendChat() {
         try {
           const j = JSON.parse(data);
           const dt = j.choices?.[0]?.delta?.content;
-          if (dt) { full += dt; node.textContent = full; node.appendChild(cursor); scrollMsgs(); }
+          if (dt) { full += dt; tnode.data += dt; scheduleScroll(); }
         } catch (e) {}
       }
     }
-    cursor.remove();
-    if (!full) { full = '（空响应）'; node.textContent = full; }
-    node.appendChild(node.querySelector('.msg-tools') || el('div','msg-tools'));
-    const cpBtn = el('button', '', '复制');
-    cpBtn.onclick = async () => { try { await navigator.clipboard.writeText(full); toast('已复制'); } catch (e) {} };
-    node.querySelector('.msg-tools')?.appendChild(cpBtn);
+    if (!full) full = '（空响应）';
+    finishAssistant(node, full);
     CHAT_HIST.push({ role:'assistant', content: full });
     if (CHAT_HIST.length > 40) CHAT_HIST = CHAT_HIST.slice(-40);
     const s = curSess();
@@ -1327,21 +1480,31 @@ async function sendChat() {
     s.ts = Date.now();
     saveSessions(); renderSessSelect();
   } catch (e) {
-    cursor.remove();
     if (e.name === 'AbortError') {
-      node.textContent = full || '（已停止）';
+      finishAssistant(node, full, full ? '（已停止）' : null);
       if (full) CHAT_HIST.push({ role:'assistant', content: full });
       toast('已停止生成', 'info');
     } else {
-      node.textContent = '请求失败：' + e.message;
+      finishAssistant(node, '请求失败：' + e.message);
       CHAT_HIST.pop();
       toast(e.message, 'err', 7000);
     }
   } finally {
+    clearInterval(genTimer);
+    genStat.hidden = true;
     sendBtn.hidden = false; stopBtn.hidden = true;
     abortChat = null;
     $('cInput').focus();
   }
+}
+
+/* 流式结束：光标移除、按 Markdown 重排正文、挂上复制按钮 */
+function finishAssistant(node, raw, fallbackText) {
+  const body = node.querySelector('.msg-text');
+  node._raw = raw || '';
+  body.innerHTML = mdRender(fallbackText != null ? fallbackText : (raw || '（空响应）'));
+  node.appendChild(toolsRow(() => node._raw));
+  scheduleScroll();
 }
 $('cInput').addEventListener('input', e => {
   e.target.style.height = 'auto';
@@ -1393,8 +1556,8 @@ const DOCS = [
   ['GET','/v1/models','模型列表（含 capabilities、available）','文本 / 生图'],
   ['POST','/v1/chat/completions','OpenAI 兼容对话，支持流式与 tools','文本'],
   ['POST','/v1/messages','Anthropic 兼容对话，支持流式与 tool_use','文本'],
-  ['POST','/v1/images/generations','文生图（url 或 b64_json）','生图'],
-  ['POST','/v1/images/edits','图生图 / 改图（multipart 上传）','改图'],
+  ['POST','/v1/images/generations','文生图；可选 images[] 最多 3 张参考图','生图'],
+  ['POST','/v1/images/edits','图生图；image 最多 3 张（multipart）','改图'],
   ['POST','/v1/files','文件上传（图像理解等）','通用'],
   ['GET','/v1/files/{id}','读取已上传文件','通用'],
   ['GET','/health','网关与浏览器会话健康状态','系统'],

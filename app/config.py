@@ -46,6 +46,10 @@ class Settings(BaseSettings):
 
     UPSTREAM_TIMEOUT: float = 240.0
 
+    # nonce 缓存秒数：省掉每次对话前取 nonce 的一次上游往返。
+    # 上游拒绝请求时网关会自动作废缓存重新获取；若实测 nonce 为一次性可设为 0 关闭。
+    NONCE_CACHE_TTL: float = 30.0
+
     # 会话（cookie）刷新间隔（秒）：cf_clearance 通常数小时过期
     COOKIE_REFRESH_INTERVAL: int = 7200
 

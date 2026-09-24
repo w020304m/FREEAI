@@ -33,7 +33,7 @@ FREEAI 是一个**本地运行的网关服务**：把 `aifreeforever.com` 的站
 
 | 能力 | 端点 | 状态 |
 |---|---|---|
-| 文本对话（流式 / 非流式） | `POST /v1/chat/completions` | ✅ |
+| 文本对话（流式 / 非流式） | `POST /v1/chat/completions` | ✅ 真流式（CDP binding 逐块转发） |
 | 文本对话（Anthropic 格式） | `POST /v1/messages` | ✅ |
 | 模型列表（含能力标注） | `GET /v1/models` | ✅ |
 | 文生图 | `POST /v1/images/generations` | ✅ |
@@ -64,18 +64,22 @@ FREEAI 是一个**本地运行的网关服务**：把 `aifreeforever.com` 的站
 ① 网关把工具定义（JSON Schema）渲染成一段文本
 ② 注入到 system prompt 里，并约定输出协议：
      "当需要调用工具时，独占一行输出：<<TOOL_CALL>>{"name":"...","arguments":{...}}"
+     "工具结果会以 [tool_result] 开头回传；收到后未完成则继续调用，已完成则给最终回答"
         ↓
 ③ 上游模型（并不知道什么是 function calling）被要求按这个格式输出
         ↓
 ④ 网关用正则从纯文本回复里"抠"出 <<TOOL_CALL>> 标记
 ⑤ 解析 JSON，还原成原生的 tool_calls（OpenAI）或 tool_use（Anthropic）结构
+⑥ 客户端回传 role=tool 结果时，网关把它拼进本轮 question
+   （[tool_call ...] + [tool_result] ...），模型据此续跑或收尾 —— agent 循环得以闭环
 ```
 
 对应代码：
 
-- `formats.tools_prompt()` —— 把工具 schema 渲染进 system prompt
+- `formats.tools_prompt()` —— 把工具 schema 与完整协议（含续跑规则）渲染进 system prompt
 - `formats.TOOL_MARKER = "<<TOOL_CALL>>"` —— 约定的文本标记
-- `formats.parse_tool_call()` —— 从模型输出的**纯文本**里解析调用
+- `formats.parse_tool_call()` —— 从模型输出的**纯文本**里解析调用（容忍 markdown 包裹/行尾附带文字）
+- `chat.py` 的 `_prepare_turn()` —— 把末尾 role=tool 结果（含并行调用多条）拼为当前提问
 - `chat.py` 的多处调用点 —— 在完整响应与流式分片中还原成原生结构
 
 ### 2.3 因此存在的问题（务必知悉）
@@ -85,7 +89,7 @@ FREEAI 是一个**本地运行的网关服务**：把 `aifreeforever.com` 的站
 | 1 | **不是原生能力** | 模型并未真正"理解"工具调用协议，只是在模仿文本格式。可靠性完全取决于模型是否听话。 |
 | 2 | **可能不遵守格式** | 模型可能拒绝输出标记、输出变体格式、把标记写在句子中间、或用 markdown 代码块包裹，导致解析失败。 |
 | 3 | **参数可能幻觉** | 模型可能编造 schema 里不存在的参数名，或给出类型错误的参数值。**网关不会做严格的 JSON Schema 校验**。 |
-| 4 | **多轮工具调用不可靠** | 原生 function calling 有专门的对齐训练；纯提示词模拟在多轮（调用→结果→再调用）时容易丢失上下文或格式崩坏。 |
+| 4 | **多轮工具调用依赖模型配合** | 网关已把工具结果回传与续跑协议做完整（agent 循环可闭环，实测 deepseek/gpt 系模型可用），但它仍是提示词模拟：模型不遵守格式时循环仍会失败。 |
 | 5 | **流式解析是启发式的** | 流式输出时标记可能被切分到多个 chunk，网关需要缓冲拼接后判断，存在边缘情况。 |
 | 6 | **与真实回答混淆** | 如果模型在正常回答里恰好写出 `<<TOOL_CALL>>` 字样，会被误判为工具调用。 |
 | 7 | **token 浪费** | 工具 schema 会被完整塞进 system prompt，占用上下文。工具多时尤其明显。 |
@@ -218,17 +222,28 @@ curl -X POST http://127.0.0.1:8110/v1/images/generations \
   -d '{"model":"gpt-image-2","prompt":"a serene japanese garden","n":1,"size":"1024x1024"}'
 ```
 
+带参考图（最多 3 张，data-URI / http URL / 纯 base64；有参考图时走工作台通道）：
+
+```bash
+curl -X POST http://127.0.0.1:8110/v1/images/generations \
+  -H "Authorization: Bearer 你的API_MASTER_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen-image","prompt":"same scene at night","images":["data:image/png;base64,..."]}'
+```
+
 ### 4.4 图像修改（图生图）
 
 ```bash
 curl -X POST http://127.0.0.1:8110/v1/images/edits \
   -H "Authorization: Bearer 你的API_MASTER_KEY" \
   -F image=@input.png \
+  -F image=@ref2.png \
+  -F image=@ref3.png \
   -F model=gpt-image-2 \
   -F prompt="change the red square to blue"
 ```
 
-> 改图需要上游的人机验证 token，首次请求较慢（约 20–40 秒），之后 110 秒内会复用缓存。
+> `image` 可重复上传，最多 **3** 张。改图需要 Turnstile token（工作台页自动采集，一次性，不能复用）。
 
 ### 4.5 工具调用（存在前述问题）
 
@@ -373,6 +388,7 @@ FREEAI/
 | `TURNSTILE_SOLVER_URL` / `_KEY` | 空 | 外部验证码求解服务（可选，留空则浏览器内采集） |
 | `USE_DIRECT_HTTP` | `False` | 直连 HTTP 加速通道（实测无效，保持关闭） |
 | `UPSTREAM_TIMEOUT` | `240` | 上游请求超时（秒） |
+| `NONCE_CACHE_TTL` | `30` | 上游 nonce 缓存秒数（省去每次对话前的一次往返；上游拒绝时自动作废。实测为一次性就设 0） |
 | `MODELS_CACHE_TTL` | `3600` | 模型列表缓存（秒） |
 
 完整配置见 `.env.example`。

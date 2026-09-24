@@ -18,9 +18,11 @@ import json
 import logging
 import os
 import subprocess
+import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from typing import Any, Dict, List, Optional
 
 try:
@@ -29,6 +31,11 @@ except ImportError:  # pragma: no cover
     SocketTimeout = TimeoutError
 
 logger = logging.getLogger(__name__)
+
+# CDP 管理流量（127.0.0.1 调试端口）绝不能走系统代理：
+# urllib 默认读取 Windows 系统代理设置，代理开启后 loopback 请求会被路由进代理并被
+# 拒绝（HTTP 502 Bad Gateway），表现为"窗口明明开着却全部 503"。这里强制直连。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 # 常见浏览器安装位置（按优先级）。用户可用 .env 的 BROWSER_EXECUTABLE 覆盖。
@@ -119,6 +126,9 @@ class CdpBridge:
         self._last_launch = 0.0
         self._last_verify_prompt = 0.0
         self._cookies: List[Dict[str, Any]] = []
+        # is_alive 探测的短 TTL 缓存（check_ready 每请求都会调用）
+        self._alive: bool = False
+        self._alive_ts: float = 0.0
         self._cookie_file = os.path.join(
             os.path.dirname(os.path.dirname(__file__)), "browser_data", "cdp_cookies.json"
         )
@@ -227,21 +237,35 @@ class CdpBridge:
                 return
 
     def is_alive(self) -> bool:
-        """CDP 端口是否可用。
+        """CDP 端口是否可用（3 秒 TTL 缓存）。
 
-        注意：单次探测失败**不等于**窗口已死（浏览器忙、GC 停顿都可能瞬时失败），
-        因此重试数次后才判定为不可用，避免误触发 launch() 把健康窗口弄坏。
+        注意：
+        - 单次探测失败**不等于**窗口已死（浏览器忙、GC 停顿都可能瞬时失败），
+          因此重试数次后才判定为不可用，避免误触发 launch() 把健康窗口弄坏。
+        - check_ready 每请求都会问询存活状态，TTL 缓存避免高频重复探测；
+          探测本身是阻塞 urllib，调用方在异步上下文应使用 is_alive_async()。
         """
+        now = time.time()
+        if now - self._alive_ts < 3.0:
+            return self._alive
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
+                with _OPENER.open(f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
                     if r.status == 200:
+                        self._alive = True
+                        self._alive_ts = now
                         return True
             except Exception:  # noqa: BLE001
                 pass
             if attempt < 2:
                 time.sleep(0.4)
+        self._alive = False
+        self._alive_ts = now
         return False
+
+    async def is_alive_async(self) -> bool:
+        """异步上下文用的存活探测：阻塞探测放线程池，不卡事件循环。"""
+        return await asyncio.to_thread(self.is_alive)
 
     def _port_in_use(self) -> bool:
         """端口是否被占用（即使 CDP 不响应）。用于避免重复拉起进程。"""
@@ -268,7 +292,7 @@ class CdpBridge:
             import websocket
 
             ver = json.loads(
-                urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json/version", timeout=5).read()
+                _OPENER.open(f"http://127.0.0.1:{self.port}/json/version", timeout=5).read()
             )
             ws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=10)
             try:
@@ -325,7 +349,7 @@ class CdpBridge:
 
     def _list_pages(self) -> List[Dict[str, Any]]:
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
+            with _OPENER.open(f"http://127.0.0.1:{self.port}/json", timeout=5) as r:
                 targets = json.loads(r.read())
             return [t for t in targets if t.get("type") == "page"]
         except Exception as e:  # noqa: BLE001
@@ -361,7 +385,7 @@ class CdpBridge:
                 f"http://127.0.0.1:{self.port}/json/new?{urllib.parse.quote(url, safe='')}",
                 method="PUT",
             )
-            with urllib.request.urlopen(req, timeout=15) as r:
+            with _OPENER.open(req, timeout=15) as r:
                 return json.loads(r.read())
         except Exception as e:  # noqa: BLE001
             logger.warning("CDP 新开标签页失败: %s", e)
@@ -425,7 +449,7 @@ class CdpBridge:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{self.port}/json/activate/{tid}", method="GET"
             )
-            with urllib.request.urlopen(req, timeout=8) as r:
+            with _OPENER.open(req, timeout=8) as r:
                 r.read()
         except Exception as e:  # noqa: BLE001
             logger.debug("激活标签页失败（忽略）: %s", e)
@@ -448,10 +472,8 @@ class CdpBridge:
         if n:
             logger.info("已恢复 %d 个浏览器窗口", n)
 
-    async def _eval_once(
-        self, page: Dict[str, Any], expr: str, timeout: float
-    ) -> Any:
-        """对指定页面执行一次 evaluate（不激活、不切换前台）。"""
+    def _eval_once_sync(self, page: Dict[str, Any], expr: str, timeout: float) -> Any:
+        """对指定页面执行一次 evaluate（阻塞 websocket 交互，只应在线程中调用）。"""
         import websocket
 
         ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=timeout)
@@ -471,6 +493,17 @@ class CdpBridge:
                     return msg.get("result", {}).get("result", {}).get("value")
         finally:
             ws.close()
+
+    async def _eval_once(
+        self, page: Dict[str, Any], expr: str, timeout: float
+    ) -> Any:
+        """对指定页面执行一次 evaluate（不激活、不切换前台）。
+
+        websocket recv 是阻塞调用且会持续整个上游响应时长（最长 240s），
+        必须放线程执行 —— 否则一次聊天会冻结整个 FastAPI 事件循环，
+        面板健康检查、其他请求全部无响应。
+        """
+        return await asyncio.to_thread(self._eval_once_sync, page, expr, timeout)
 
     async def _eval(self, expr: str, timeout: float = 300.0, prefer: str = "") -> Any:
         page = self._find_page(prefer=prefer)
@@ -517,11 +550,12 @@ class CdpBridge:
         """
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if not self.is_alive():
+            if not await self.is_alive_async():
                 logger.warning("CDP 窗口失联，重新拉起浏览器...")
-                self.launch()
+                # launch 内部有秒级 sleep 与进程等待，放线程避免冻结事件循环
+                await asyncio.to_thread(self.launch)
                 await asyncio.sleep(4)
-            if not self.ensure_site_page(timeout=20.0):
+            if not await asyncio.to_thread(self.ensure_site_page, timeout=20.0):
                 await asyncio.sleep(4)
                 continue
             page = self._find_page()
@@ -545,7 +579,7 @@ class CdpBridge:
                         return True
                     if status in (403, 503):
                         # 只有这种情况才可能真的需要人工过验证；也仍可能是 IP 限流
-                        challenge = self._page_is_challenge()
+                        challenge = await asyncio.to_thread(self._page_is_challenge)
                         if challenge:
                             now = time.time()
                             if now - self._last_verify_prompt > 60:
@@ -688,34 +722,138 @@ class CdpBridge:
         on_end: Any,
         timeout: float = 300.0,
     ) -> None:
-        """页面内流式 fetch：一次性取回 SSE 全文后逐行回调（网关侧再转发为真流式）。"""
+        """页面内**真流式** fetch：页面侧 response.body.getReader() 每读到一块 SSE 数据，
+        就通过 CDP Runtime.binding 实时推回本桥，再回调 on_data。
+
+        旧实现 await r.text() 等整个响应结束后再逐行重放（伪流式）——客户端要等
+        模型全部生成完才一次性收到所有内容。现在面板与所有 OpenAI / Anthropic
+        客户端都能逐块看到输出。
+
+        契约与旧版一致：on_data 收到的是**已剥壳的 SSE data 载荷**（如 '{"token":"..."}'），
+        非 SSE 的 JSON 响应（{"answer":...}）沿用旧版兜底逻辑合成 token 事件。
+        """
+        import websocket
+
+        page = self._find_page()
+        if not page:
+            raise RuntimeError("未找到可用的浏览器标签页（请确认浏览器窗口已打开）")
+
+        binding = "__gwChunk" + uuid.uuid4().hex[:8]
+        loop = asyncio.get_running_loop()
+        queue: "asyncio.Queue" = asyncio.Queue()
+        SENTINEL = object()  # 泵线程结束标记
+
+        # 页面侧：读流并把每块推给 binding。非 200 / 异常用 __err__:status:msg 标记。
         expr = f"""(async () => {{
-            const r = await fetch('{url}', {{
-                method: 'POST',
-                headers: {{'Content-Type': 'application/json'}},
-                body: JSON.stringify({json.dumps(payload)})
-            }});
-            const t = await r.text();
-            return JSON.stringify({{status: r.status, ctype: r.headers.get('content-type'), text: t.slice(0, 400000)}});
+            const push = (m) => {{ try {{ {binding}(m); }} catch (e) {{}} }};
+            try {{
+                const r = await fetch('{url}', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({json.dumps(payload)})
+                }});
+                if (!r.ok) {{
+                    const t = await r.text();
+                    push('__err__:' + r.status + ':' + t.slice(0, 300));
+                    return JSON.stringify({{status: r.status}});
+                }}
+                const reader = r.body.getReader();
+                const dec = new TextDecoder();
+                for (;;) {{
+                    const {{done, value}} = await reader.read();
+                    if (done) break;
+                    push(dec.decode(value, {{stream: true}}));
+                }}
+                push('__done__');
+                return JSON.stringify({{status: r.status}});
+            }} catch (e) {{
+                push('__err__:-1:' + String((e && e.message) || e).slice(0, 300));
+                return JSON.stringify({{status: -1, err: String(e)}});
+            }}
         }})()"""
-        out = await self._eval(expr, timeout=timeout)
-        parsed = json.loads(out or "{}")
-        logger.info("[stream_chat] status=%s ctype=%s text_len=%d head=%r",
-                    parsed.get("status"), parsed.get("ctype"),
-                    len(parsed.get("text", "")), parsed.get("text", "")[:80])
-        if parsed.get("status") != 200:
-            raise RuntimeError(f"上游 HTTP {parsed.get('status')}: {parsed.get('text','')[:200]}")
-        text = parsed.get("text", "")
-        saw_sse = False
-        for line in text.splitlines():
-            line = line.strip()
-            if line.startswith("data:"):
-                data = line[5:].strip()
-                if data and data != "[DONE]":
-                    saw_sse = True
-                    await on_data(data)
-        if not saw_sse:
+
+        def pump() -> None:
+            """阻塞读 CDP websocket（独立线程），把 binding 载荷转投 asyncio 队列。"""
+            ws = None
+            try:
+                ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=120)
+                ws.send(json.dumps({"id": 1, "method": "Runtime.addBinding",
+                                    "params": {"name": binding}}))
+                ws.send(json.dumps({"id": 2, "method": "Runtime.evaluate",
+                                    "params": {"expression": expr, "returnByValue": True,
+                                               "awaitPromise": True}}))
+                while True:
+                    msg = json.loads(ws.recv())
+                    if msg.get("method") == "Runtime.bindingCalled":
+                        p = msg.get("params", {})
+                        if p.get("name") == binding:
+                            loop.call_soon_threadsafe(queue.put_nowait, p.get("payload", ""))
+                    elif msg.get("id") == 2:
+                        # evaluate 返回 = 页面侧流程结束（正常结束时 __done__ 已先到）
+                        loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
+                        return
+            except Exception as e:  # noqa: BLE001
+                loop.call_soon_threadsafe(queue.put_nowait, ("__pumperr__", str(e)))
+                loop.call_soon_threadsafe(queue.put_nowait, SENTINEL)
+            finally:
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+        threading.Thread(target=pump, name="cdp-stream-pump", daemon=True).start()
+
+        buf = ""
+        err: Optional[str] = None
+        saw_data = False
+        raw_all: List[str] = []
+        deadline = time.time() + timeout
+        while True:
+            remain = deadline - time.time()
+            if remain <= 0:
+                raise RuntimeError(f"上游流式超时（{timeout:.0f}s 无完整响应）")
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=min(remain, 130))
+            except asyncio.TimeoutError:
+                raise RuntimeError(f"上游流式停滞（{min(remain, 130):.0f}s 无数据）")
+            if item is SENTINEL:
+                break
+            if isinstance(item, tuple) and item and item[0] == "__pumperr__":
+                raise RuntimeError(f"CDP 桥流式通道中断: {item[1]}")
+            if not isinstance(item, str):
+                continue
+            if item.startswith("__err__:"):
+                err = item[len("__err__:"):]
+                continue
+            if item == "__done__":
+                continue
+            raw_all.append(item)
+            buf += item
+            # chunk 可能从 SSE 行中间切断：按完整行切，半行留到下一块
+            lines = buf.split("\n")
+            buf = lines.pop()
+            for line in lines:
+                line = line.strip()
+                if line.startswith("data:"):
+                    data = line[5:].strip()
+                    if data and data != "[DONE]":
+                        saw_data = True
+                        await on_data(data)
+        # 收尾：冲刷未换行的残余行
+        tail = buf.strip()
+        if tail.startswith("data:"):
+            data = tail[5:].strip()
+            if data and data != "[DONE]":
+                saw_data = True
+                await on_data(data)
+
+        if err is not None:
+            code, _, msg = err.partition(":")
+            raise RuntimeError(f"上游 HTTP {code}: {msg}")
+        if not saw_data:
             # 上游可能对短响应直接返回 JSON（{"answer": ...}，前端 Te() 同款兼容）→ 合成 token 事件
+            text = "".join(raw_all)
             try:
                 body = json.loads(text)
             except Exception:  # noqa: BLE001
