@@ -129,8 +129,9 @@ class CdpBridge:
         # is_alive 探测的短 TTL 缓存（check_ready 每请求都会调用）
         self._alive: bool = False
         self._alive_ts: float = 0.0
+        from . import config as _cfg  # 局部导入与文件内既有模式一致
         self._cookie_file = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "browser_data", "cdp_cookies.json"
+            _cfg.settings.BROWSER_USER_DATA_DIR, "cdp_cookies.json"
         )
 
     # ---------- cookie（供 /admin/cookies 兼容；CDP 模式下主要靠窗口会话）----------
@@ -191,7 +192,7 @@ class CdpBridge:
         from . import config as _cfg
 
         profile = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)), "browser_data", "cdp_profile"
+            _cfg.settings.BROWSER_USER_DATA_DIR, "cdp_profile"
         )
         os.makedirs(profile, exist_ok=True)
         browser = find_browser()
@@ -216,7 +217,13 @@ class CdpBridge:
         # 窗口保留在屏幕内，任务栏可点击恢复；需要人机验证时由
         # request_human_verification() 呼出到前台。
         # 出口代理（会话绑代理出口 IP：住宅代理可显著延长 cf_clearance 有效期 + 每 IP 图像配额按出口计）
+        # 优先级:显式 OUTBOUND_PROXY > 本机出口转发器(代理池可换 IP,配额触发自动轮换)
         proxy = getattr(_cfg.settings, "OUTBOUND_PROXY", "") or ""
+        if not proxy:
+            from . import upstream_proxy
+            if upstream_proxy.enabled() and upstream_proxy.address():
+                proxy = upstream_proxy.address()
+                logger.info("窗口挂载本机出口转发器(池内 IP 可轮换): %s", proxy)
         if proxy:
             args.append(f"--proxy-server={proxy}")
             logger.info("窗口挂载出口代理: %s", proxy)
@@ -754,7 +761,8 @@ class CdpBridge:
                 }});
                 if (!r.ok) {{
                     const t = await r.text();
-                    push('__err__:' + r.status + ':' + t.slice(0, 300));
+                    // 4000 字符:409 model_unavailable 的响应体带完整可用模型列表,供网关自动换模型
+                    push('__err__:' + r.status + ':' + t.slice(0, 4000));
                     return JSON.stringify({{status: r.status}});
                 }}
                 const reader = r.body.getReader();
@@ -890,6 +898,14 @@ class CdpBridge:
     async def harvest_turnstile(self, timeout: float = 90.0) -> Optional[str]:
         """在窗口内采集 Cloudflare Turnstile token（改图/图生图通道需要）。
 
+        实现说明：整段采集（注入脚本/真实鼠标事件/等待 token）全是阻塞调用，
+        最长可达 timeout 秒 —— 必须放线程执行，否则采集期间整个事件循环被冻结，
+        面板健康检查与其他请求全部无响应。"""
+        return await asyncio.to_thread(self._harvest_turnstile_sync, timeout)
+
+    def _harvest_turnstile_sync(self, timeout: float = 90.0) -> Optional[str]:
+        """在窗口内采集 Cloudflare Turnstile token（阻塞版，只应在线程中调用）。
+
         实测结论（关键）：
         - Turnstile 必须用 **managed/normal 模式**渲染（invisible 模式不签发 token）。
         - 点击必须用 **CDP Input.dispatchMouseEvent**（受信任事件）；JS 的 el.click()
@@ -956,7 +972,7 @@ class CdpBridge:
                 vis = ev("document.visibilityState")
                 if vis == "visible":
                     break
-                await asyncio.sleep(0.25)
+                time.sleep(0.25)
             logger.info("Turnstile 采集前 visibility=%s", ev("document.visibilityState"))
             # 1) 注入并渲染 managed 模式 widget（可见）
             out = ev(
@@ -1003,7 +1019,7 @@ class CdpBridge:
             # 2) 等 host 出现并定位
             host = None
             for _ in range(12):
-                await asyncio.sleep(1.0)
+                time.sleep(1.0)
                 raw = ev(
                     """(() => { const h = document.getElementById('__gw_ts_host'); if (!h) return null;
                         const r = h.getBoundingClientRect();
@@ -1040,8 +1056,8 @@ class CdpBridge:
                             "buttons": 0,
                         },
                     )
-                    await asyncio.sleep(0.07)
-                await asyncio.sleep(0.35)
+                    time.sleep(0.07)
+                time.sleep(0.35)
                 call(
                     "Input.dispatchMouseEvent",
                     {"type": "mousePressed", "x": tx, "y": ty, "button": "left", "clickCount": 1, "buttons": 1},
@@ -1054,7 +1070,7 @@ class CdpBridge:
 
                 # 每轮点击后等 token（约 8s）
                 for _ in range(6):
-                    await asyncio.sleep(1.4)
+                    time.sleep(1.4)
                     tok = ev("window.__gwTsToken || null")
                     if tok:
                         logger.info("Turnstile token 已获取（CDP 真实交互，第 %d 次点击），长度 %d", attempt, len(tok))

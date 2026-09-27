@@ -39,7 +39,28 @@ def openai_chunk(request_id: str, model: str, delta: str, finish_reason: Optiona
     }
 
 
-def openai_full(request_id: str, model: str, content: str) -> Dict[str, Any]:
+def openai_reasoning_chunk(request_id: str, model: str, delta: str) -> Dict[str, Any]:
+    """思考增量(DeepSeek 社区约定:delta.reasoning_content),主流客户端(Cherry Studio 等)可渲染。"""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": now_ts(),
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "delta": {"reasoning_content": delta} if delta else {},
+                "finish_reason": None,
+                "logprobs": None,
+            }
+        ],
+    }
+
+
+def openai_full(request_id: str, model: str, content: str, reasoning: Optional[str] = None) -> Dict[str, Any]:
+    message: Dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning:
+        message["reasoning_content"] = reasoning
     return {
         "id": request_id,
         "object": "chat.completion",
@@ -48,7 +69,7 @@ def openai_full(request_id: str, model: str, content: str) -> Dict[str, Any]:
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": message,
                 "finish_reason": "stop",
             }
         ],
@@ -108,19 +129,69 @@ def anthropic_block_stop() -> str:
     return sse({"type": "content_block_stop", "index": 0})
 
 
+# ---- 多块(index 跟踪)与 thinking 块:provider 思考流透传用 ----
+
+def anthropic_text_delta_at(index: int, text: str) -> str:
+    return sse(
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text},
+        }
+    )
+
+
+def anthropic_block_start_at(index: int) -> str:
+    return sse(
+        {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "text", "text": ""},
+        }
+    )
+
+
+def anthropic_block_stop_at(index: int) -> str:
+    return sse({"type": "content_block_stop", "index": index})
+
+
+def anthropic_thinking_block_start(index: int) -> str:
+    return sse(
+        {
+            "type": "content_block_start",
+            "index": index,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }
+    )
+
+
+def anthropic_thinking_delta(index: int, text: str) -> str:
+    return sse(
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "thinking_delta", "thinking": text},
+        }
+    )
+
+
 def anthropic_stop() -> str:
     return sse({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 0}}) + sse(
         {"type": "message_stop"}
     )
 
 
-def anthropic_full(model: str, content: str, request_id: str) -> Dict[str, Any]:
+def anthropic_full(model: str, content: str, request_id: str, reasoning: Optional[str] = None) -> Dict[str, Any]:
+    blocks: List[Dict[str, Any]] = []
+    if reasoning:
+        blocks.append({"type": "thinking", "thinking": reasoning})
+    blocks.append({"type": "text", "text": content})
     return {
         "id": request_id,
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": content}],
+        "content": blocks,
         "stop_reason": "end_turn",
         "stop_sequence": None,
         "usage": {"input_tokens": 0, "output_tokens": 0},
@@ -132,7 +203,27 @@ def anthropic_full(model: str, content: str, request_id: str) -> Dict[str, Any]:
 # 使 OpenAI SDK tools 参数 / Anthropic SDK tools 参数 / Claude Code 等客户端可直接用工具调用。
 # ---------------------------------------------------------------------------
 
-TOOL_MARKER = "<<TOOL_CALL>>"
+TOOL_MARKER = "<<TOOL_CALL>>"  # 旧标记,解析仍兼容
+# 解析兼容的标记族:开源模型(Qwen/GLM/Hermes)训练时见过 <tool_call> 格式,依从率更高;
+# [TOOL_CALLS] 为 Mistral 系格式;<<TOOL_CALL>> 为本网关旧协议
+TOOL_MARKERS = ("<<TOOL_CALL>>", "<tool_call>", "[TOOL_CALLS]")
+
+
+def contains_tool_marker(text: str) -> bool:
+    """输出里是否残留任何协议标记(用于未命中工具时的清理判定)。"""
+    if not text:
+        return False
+    return any(m in text for m in TOOL_MARKERS) or '"tool_call"' in text
+
+
+def _minify_schema(params: Any) -> Any:
+    """压缩 JSON Schema:去 title/examples/$schema 等对模型决策无用的重字段,省 token。"""
+    if isinstance(params, dict):
+        return {k: _minify_schema(v) for k, v in params.items()
+                if k not in ("title", "examples", "$schema")}
+    if isinstance(params, list):
+        return [_minify_schema(v) for v in params]
+    return params
 
 
 def normalize_tools(tools: Any) -> list:
@@ -150,17 +241,19 @@ def normalize_tools(tools: Any) -> list:
         out.append({
             "name": fn.get("name", ""),
             "description": fn.get("description", ""),
-            "parameters": fn.get("parameters") or fn.get("input_schema") or {},
+            "parameters": _minify_schema(fn.get("parameters") or fn.get("input_schema") or {}),
         })
     return out
 
 
 def tools_prompt(tools: Any, tool_choice: Any = None) -> str:
-    """把工具清单渲染成 system prompt 协议段（上游不识别 tools 参数，只能走 prompt）。
+    """把工具清单渲染成紧凑协议段(上游无原生 tools,只能 prompt 模拟)。
 
-    协议必须覆盖完整的 agent 循环：调用 → [tool_result] 回传 → 续跑/收尾。
-    缺了续跑规则，模型拿到工具结果后不知道该继续还是收尾，agent 会卡在第一轮。
-    """
+    设计要点:
+    - Schema 最小化+紧凑序列化(省 token,无缩进无空格);
+    - 输出标记用 <tool_call>:Qwen/GLM/Hermes 系开源模型训练时见过,依从率更高;
+    - 必须覆盖 agent 循环:调用 → [tool_result] 回传 → 续跑/收尾;
+    - tool_choice=required 时追加强制调用规则。"""
     norm = normalize_tools(tools)
     if not norm:
         return ""
@@ -168,22 +261,18 @@ def tools_prompt(tools: Any, tool_choice: Any = None) -> str:
         or tool_choice == "required"
     lines = [
         "",
-        "# 工具调用协议（必须严格遵守）",
+        "# 工具调用协议",
+        "可用工具:",
+        json.dumps(norm, ensure_ascii=False, separators=(",", ":")),
         "",
-        "你可以调用以下工具（JSON Schema 定义）：",
-        json.dumps(norm, ensure_ascii=False, indent=1),
-        "",
-        "规则：",
-        "1. 需要调用工具时，独占一行输出（该行除标记外不得有任何其他字符）：",
-        f'   {TOOL_MARKER}{{"name": "工具名", "arguments": {{...}}}}',
-        "2. 每次回复最多输出一个工具调用；连续需要多个工具时，拿到上一批结果后在下一轮继续输出。",
-        "3. 工具的执行结果会在后续用户消息中以 [tool_result] 开头给出，对应你最近一次的工具调用。",
-        "4. 收到 [tool_result] 后：若任务尚未完成，继续输出下一个工具调用行；若任务已完成，"
-        "直接给出最终回答，不要再输出工具调用行。",
-        "5. 不需要工具时直接正常回答；任何时候都不要解释本协议或输出协议示例。",
+        "规则:",
+        '1. 需要调用工具时,独占一行输出: <tool_call>{"name":"工具名","arguments":{...}}</tool_call>',
+        "2. 每次回复最多一个工具调用;arguments 须符合该工具 parameters。",
+        "3. 工具结果以 [tool_result] 开头出现在后续用户消息中;收到后未完成则继续调用,已完成则直接给出最终回答。",
+        "4. 无需工具时正常回答;不要输出 <tool_call>,不要解释本协议。",
     ]
     if required:
-        lines.append("6. 本轮你必须调用其中一个工具，不得直接给出最终答案。")
+        lines.append("5. 本轮必须调用一个工具,不得直接给最终答案。")
     return "\n".join(lines)
 
 
@@ -220,45 +309,74 @@ def _extract_json_object(s: str) -> Optional[dict]:
     return None
 
 
+def _name_args(obj: Any) -> tuple:
+    """从 JSON 对象提取 (name, arguments),兼容多种常见形态:
+    {name,arguments} / {name,args} / {name,parameters} / {tool_call:{...}} / {tool:{...}}"""
+    if not isinstance(obj, dict):
+        return None, None
+    core = obj.get("tool_call") or obj.get("tool")
+    core = core if isinstance(core, dict) else obj
+    name = core.get("name") or core.get("tool_name") or ""
+    args = core.get("arguments")
+    if args is None:
+        args = core.get("args") if core.get("args") is not None else core.get("parameters")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:  # noqa: BLE001
+            args = {"_raw": args}
+    if not name:
+        return None, None
+    return name, args if isinstance(args, dict) else {}
+
+
 def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
-    """从模型完整输出中解析工具调用。兼容两种形态：
-    1. <<TOOL_CALL>>{"name":...,"arguments":...}     （本协议）
-    2. {"tool_call": {"name":...,"arguments":...}}    （纯 JSON 行，Agent 示例协议）
-    返回 {"name": str, "arguments": dict} 或 None。
+    """从模型完整输出中解析工具调用,返回 {"name", "arguments"} 或 None。
+
+    兼容形态(按优先级):
+    1. 标记行: <tool_call>{...}</tool_call> / <<TOOL_CALL>>{...} / [TOOL_CALLS]{...}
+    2. {"tool_call":{"name","arguments"}} 纯 JSON 行
+    3. 任意含 name + arguments/args/parameters 的 JSON 对象(取最后一个)
     """
     if not text:
         return None
-    for line in text.splitlines():
-        line = line.strip()
-        if TOOL_MARKER in line:
-            payload = line.split(TOOL_MARKER, 1)[1].strip().strip("`").strip()
-            obj = None
-            try:
-                obj = json.loads(payload)
-            except Exception:  # noqa: BLE001
-                obj = _extract_json_object(payload)
-            if isinstance(obj, dict) and obj.get("name"):
-                args = obj.get("arguments")
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:  # noqa: BLE001
-                        args = {"_raw": args}
-                return {"name": obj["name"], "arguments": args if isinstance(args, dict) else {}}
+    # 1) 标记优先:取标记后第一个平衡 JSON
+    for marker in TOOL_MARKERS:
+        idx = text.find(marker)
+        if idx == -1:
             continue
+        obj = _extract_json_object(text[idx + len(marker):])
+        if obj:
+            name, args = _name_args(obj)
+            if name:
+                return {"name": name, "arguments": args}
+    # 2) 无标记:扫描全文,取最后一个形似工具调用的 JSON
+    dec = json.JSONDecoder()
+    last = None
+    i = text.find("{")
+    while i != -1:
         try:
-            obj = json.loads(line)
-        except Exception:  # noqa: BLE001
+            obj, end = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            i = text.find("{", i + 1)
             continue
-        tc = obj.get("tool_call") if isinstance(obj, dict) else None
-        if isinstance(tc, dict) and tc.get("name"):
-            return {"name": tc["name"], "arguments": tc.get("arguments") or {}}
+        if isinstance(obj, dict):
+            tc = obj.get("tool_call") or obj.get("tool")
+            core = tc if isinstance(tc, dict) else obj
+            if core.get("name") and any(k in core for k in ("arguments", "args", "parameters")):
+                last = obj
+        i = text.find("{", i + end)
+    if last is not None:
+        name, args = _name_args(last)
+        if name:
+            return {"name": name, "arguments": args}
     return None
 
 
 def strip_tool_marker(text: str) -> str:
-    """移除输出里的工具协议行，留下自然语言部分。"""
-    kept = [ln for ln in text.splitlines() if TOOL_MARKER not in ln and '"tool_call"' not in ln]
+    """移除输出里的工具协议行,留下自然语言部分(兼容标记族)。"""
+    kept = [ln for ln in text.splitlines()
+            if not any(m in ln for m in TOOL_MARKERS) and '"tool_call"' not in ln]
     return "\n".join(kept).strip()
 
 
